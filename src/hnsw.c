@@ -74,6 +74,16 @@ HnswInit(void)
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+	// todo dkx
+	add_int_reloption(hnsw_relopt_kind, "m1", "Max number of connections (column 1)",
+					  0, 0, HNSW_MAX_M, AccessExclusiveLock);
+	add_int_reloption(hnsw_relopt_kind, "ef_construction1", "Size of the dynamic candidate list for construction (column 1)",
+					  0, 0, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+
+	add_int_reloption(hnsw_relopt_kind, "m2", "Max number of connections (column 2)",
+					  0, 0, HNSW_MAX_M, AccessExclusiveLock);
+	add_int_reloption(hnsw_relopt_kind, "ef_construction2", "Size of the dynamic candidate list for construction (column 2)",
+					  0, 0, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -226,12 +236,52 @@ hnswoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
-	};
 
-	return (bytea *) build_reloptions(reloptions, validate,
-									  hnsw_relopt_kind,
-									  sizeof(HnswOptions),
-									  tab, lengthof(tab));
+		// todo dkx
+		{"m1", RELOPT_TYPE_INT, offsetof(HnswOptions, m1)},
+		{"ef_construction1", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction1)},
+		{"m2", RELOPT_TYPE_INT, offsetof(HnswOptions, m2)},
+		{"ef_construction2", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction2)},
+	};
+	HnswOptions *opts = (HnswOptions *) build_reloptions(reloptions, validate,
+													 hnsw_relopt_kind,
+													 sizeof(HnswOptions),
+													 tab, lengthof(tab));
+
+	bool new_used =
+		(opts->m1 > 0) || (opts->efConstruction1 > 0) ||
+		(opts->m2 > 0) || (opts->efConstruction2 > 0);
+
+	if (new_used)
+	{
+		/* 4 参数模式：要求四个都给齐 */
+		if (opts->m1 <= 0 || opts->efConstruction1 <= 0 ||
+			opts->m2 <= 0 || opts->efConstruction2 <= 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("hydex HNSW options: when using m1/ef_construction1/m2/ef_construction2, all four must be > 0")));
+		}
+
+		/* 这里通常选择：忽略 legacy m/efConstruction（保持兼容），或者你也可以在 validate 时更严格 */
+	}
+	else
+	{
+		/* 2 参数模式（旧逻辑）：把旧参数复制到两套上，后续统一用 m1/ef1/m2/ef2 */
+		opts->m1 = opts->m;
+		opts->efConstruction1 = opts->efConstruction;
+		opts->m2 = opts->m;
+		opts->efConstruction2 = opts->efConstruction;
+	}
+
+	return (bytea *) opts;
+	// todo dkx
+
+
+	// return (bytea *) build_reloptions(reloptions, validate,
+	// 								  hnsw_relopt_kind,
+	// 								  sizeof(HnswOptions),
+	// 								  tab, lengthof(tab));
 }
 
 /*
@@ -261,7 +311,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->amcanorderbyop = true;
 	amroutine->amcanbackward = false;	/* can change direction mid-scan */
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
+	amroutine->amcanmulticol = true;	// todo dkx
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;
@@ -281,7 +331,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->amkeytype = InvalidOid;
 
 	/* Interface functions */
-	amroutine->ambuild = hnswbuild;
+	amroutine->ambuild = hnswbuild;			// todo dkx
 	amroutine->ambuildempty = hnswbuildempty;
 	amroutine->aminsert = hnswinsert;
 #if PG_VERSION_NUM >= 170000
@@ -291,10 +341,10 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->amvacuumcleanup = hnswvacuumcleanup;
 	amroutine->amcanreturn = NULL;
 	amroutine->amcostestimate = hnswcostestimate;
-	amroutine->amoptions = hnswoptions;
+	amroutine->amoptions = hnswoptions;		// todo dkx ok
 	amroutine->amproperty = NULL;	/* TODO AMPROP_DISTANCE_ORDERABLE */
 	amroutine->ambuildphasename = hnswbuildphasename;
-	amroutine->amvalidate = hnswvalidate;
+	amroutine->amvalidate = hnswvalidate;				// todo dkx ok
 #if PG_VERSION_NUM >= 140000
 	amroutine->amadjustmembers = NULL;
 #endif

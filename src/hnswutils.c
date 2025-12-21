@@ -114,6 +114,26 @@ HnswGetM(Relation index)
 	return HNSW_DEFAULT_M;
 }
 
+int
+HnswGetMColumn(Relation index, int col)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+	{
+		/* === 两列最小支持：如果你已经在 HnswOptions 里加了 m1/m2 === */
+		/* 注：字段名以你实际为准；没加这些字段就删掉这段分支 */
+
+		if (col == 0 && opts->m1 > 0) return opts->m1;
+		if (col == 1 && opts->m2 > 0) return opts->m2;
+
+		/* 其它列先回退到默认 m（你未来扩展 N 列再改） */
+		return opts->m;
+	}
+
+	return HNSW_DEFAULT_M;
+}
+
 /*
  * Get the size of the dynamic candidate list in the index
  */
@@ -124,6 +144,23 @@ HnswGetEfConstruction(Relation index)
 
 	if (opts)
 		return opts->efConstruction;
+
+	return HNSW_DEFAULT_EF_CONSTRUCTION;
+}
+
+int
+HnswGetEfConstructionColumn(Relation index, int col)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+	{
+
+		if (col == 0 && opts->efConstruction1 > 0) return opts->efConstruction1;
+		if (col == 1 && opts->efConstruction2 > 0) return opts->efConstruction2;
+
+		return opts->efConstruction;
+	}
 
 	return HNSW_DEFAULT_EF_CONSTRUCTION;
 }
@@ -140,6 +177,18 @@ HnswOptionalProcInfo(Relation index, uint16 procnum)
 	return index_getprocinfo(index, 1, procnum);
 }
 
+FmgrInfo *
+HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum)
+{
+	AttrNumber attno = (AttrNumber) (col + 1); /* 1-based */
+
+	/* 先确认该 support proc 是否存在 */
+	if (!OidIsValid(index_getprocid(index, attno, procnum)))
+		return NULL;
+
+	return index_getprocinfo(index, attno, procnum);
+}
+
 /*
  * Init support functions
  */
@@ -149,6 +198,16 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+}
+
+void
+HnswInitSupportColumn(HnswSupport *support, Relation index, int col)
+{
+	AttrNumber attno = (AttrNumber) (col + 1); /* 1-based */
+
+	support->procinfo = index_getprocinfo(index, attno, HNSW_DISTANCE_PROC);
+	support->collation = index->rd_indcollation[col];
+	support->normprocinfo = HnswOptionalProcInfoColumn(index, col, HNSW_NORM_PROC);
 }
 
 /*
@@ -1377,6 +1436,25 @@ HnswGetTypeInfo(Relation index)
 		};
 
 		return (&typeInfo);
+	}
+	else
+		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));
+}
+
+const HnswTypeInfo *
+HnswGetTypeInfoColumn(Relation index, int col)
+{
+	FmgrInfo *procinfo = HnswOptionalProcInfoColumn(index, col, HNSW_TYPE_INFO_PROC);
+
+	if (procinfo == NULL)
+	{
+		static const HnswTypeInfo typeInfo = {
+			.maxDimensions = HNSW_MAX_DIM,
+			.normalize = l2_normalize,
+			.checkValue = NULL
+		};
+
+		return &typeInfo;
 	}
 	else
 		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));

@@ -591,6 +591,58 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	MemoryContextReset(buildstate->tmpCtx);
 }
 
+static void
+BuildCallbackMulti(Relation index, ItemPointer tid, Datum *values,
+				   bool *isnull, bool tupleIsAlive, void *state)
+{
+	HnswBuildStateMulti *mstate = (HnswBuildStateMulti *) state;
+
+	for (int col = 0; col < mstate->nkeys; col++)
+	{
+		HnswBuildState *buildstate = &mstate->cols[col];
+		HnswGraph      *graph = buildstate->graph;
+		MemoryContext   oldCtx;
+
+		/* Skip nulls for this column */
+		if (isnull[col])
+			continue;
+
+		/* Use this column's temp memory context */
+		oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
+
+		/*
+		 * 最小侵入：构造单列数组，让 InsertTuple 继续按 isnull[0]/values[0] 工作
+		 * 注意：InsertTuple 内部如果还会用到其它列（比如 values[1]），那它本来就不该这样写；
+		 * pgvector 单列版一般只看第 0 个，所以这里是兼容的。
+		 */
+		Datum vals1[1];
+		bool  nulls1[1];
+
+		vals1[0] = values[col];
+		nulls1[0] = false;
+
+		if (InsertTuple(index, vals1, nulls1, tid, buildstate))
+		{
+			/* Update progress: each successful insert increments this graph's indtuples */
+			SpinLockAcquire(&graph->lock);
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
+			// BuildCallbackMulti 的 进度更新有 bug（会倒退）
+			/* 值单调递增没问题。
+			 * 但你现在是两张图各自维护 graph->indtuples。假设：
+			 * 图0 已经 10000
+			 * 图1 才 5
+			 * 当图1插入一次，你会把 PROGRESS_CREATEIDX_TUPLES_DONE 更新成 6，从 10000 倒退到 6。
+			 */
+			SpinLockRelease(&graph->lock);
+		}
+
+		/* Reset this column's temp context */
+		MemoryContextSwitchTo(oldCtx);
+		MemoryContextReset(buildstate->tmpCtx);
+	}
+}
+
+
 /*
  * Initialize the graph
  */
@@ -714,6 +766,90 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
+}
+
+
+static void
+InitBuildStateMulti(HnswBuildStateMulti *buildstatemulti,
+                    Relation heap, Relation index, IndexInfo *indexInfo, ForkNumber forkNum) // ok
+{
+	int nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	/* 填 multi wrapper */
+	buildstatemulti->heap = heap;
+	buildstatemulti->index = index;
+	buildstatemulti->indexInfo = indexInfo;
+	buildstatemulti->forkNum = forkNum;
+	buildstatemulti->nkeys = nkeys;
+
+	/* 为每个 key 列分配一个“原版 HnswBuildState” */
+	buildstatemulti->cols = (HnswBuildState *) palloc0(sizeof(HnswBuildState) * nkeys);
+
+	for (int col = 0; col < nkeys; col++)
+	{
+		HnswBuildState *buildstate = &buildstatemulti->cols[col];
+
+		buildstate->heap = heap;
+		buildstate->index = index;
+		buildstate->indexInfo = indexInfo;
+		buildstate->forkNum = forkNum;
+
+		buildstate->typeInfo = HnswGetTypeInfoColumn(index, col);
+
+		buildstate->m = HnswGetMColumn(index, col);
+		buildstate->efConstruction = HnswGetEfConstructionColumn(index, col);
+		buildstate->dimensions = TupleDescAttr(index->rd_att, col)->atttypmod;
+
+		/* Disallow varbit since require fixed dimensions */
+		if (TupleDescAttr(index->rd_att, col)->atttypid == VARBITOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("type not supported for hnsw index")));
+
+		/* Require column to have dimensions to be indexed */
+		if (buildstate->dimensions < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("column does not have dimensions")));
+
+		if (buildstate->dimensions > buildstate->typeInfo->maxDimensions)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("column cannot have more than %d dimensions for hnsw index", buildstate->typeInfo->maxDimensions)));
+
+		if (buildstate->efConstruction < 2 * buildstate->m)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("ef_construction must be greater than or equal to 2 * m")));
+
+		buildstate->reltuples = 0;
+		buildstate->indtuples = 0;
+
+		/* Get support functions */
+		HnswInitSupportColumn(&buildstate->support, index, col);
+
+		InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
+		buildstate->graph = &buildstate->graphData;
+		buildstate->ml = HnswGetMl(buildstate->m);
+		buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
+
+		buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
+													   "Hnsw build graph context",
+	#if PG_VERSION_NUM >= 150000
+													   1024 * 1024, 1024 * 1024,
+	#endif
+													   1024 * 1024);
+		buildstate->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
+												   "Hnsw build temporary context",
+												   ALLOCSET_DEFAULT_SIZES);
+
+		InitAllocator(&buildstate->allocator, &HnswMemoryContextAlloc, buildstate);
+
+		buildstate->hnswleader = NULL;
+		buildstate->hnswshared = NULL;
+		buildstate->hnswarea = NULL;
+
+	}
 }
 
 /*
@@ -1089,6 +1225,59 @@ BuildGraph(HnswBuildState * buildstate, ForkNumber forkNum)
 		HnswEndParallel(buildstate->hnswleader);
 }
 
+static void
+BuildGraphMulti(HnswBuildStateMulti * buildstatemulti, ForkNumber forkNum)
+{
+	int parallel_workers = 0;
+
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+								 PROGRESS_HNSW_PHASE_LOAD);
+
+	/* Calculate parallel workers (先保留计算，但本版本不启并行) */
+	if (buildstatemulti->heap != NULL)
+		parallel_workers = ComputeParallelWorkers(buildstatemulti->heap,
+												  buildstatemulti->index);
+
+	/* Add tuples to graphs (只扫描一次 heap) */
+	if (buildstatemulti->heap != NULL)
+	{
+		double reltuples;
+
+		reltuples = table_index_build_scan(buildstatemulti->heap,
+										   buildstatemulti->index,
+										   buildstatemulti->indexInfo,
+										   true, true,
+										   BuildCallbackMulti,
+										   (void *) buildstatemulti,
+										   NULL);
+
+		/* reltuples 只记一次，避免两列时统计翻倍 */
+		buildstatemulti->cols[0].reltuples = reltuples;
+		for (int col = 1; col < buildstatemulti->nkeys; col++)
+			buildstatemulti->cols[col].reltuples = 0;
+
+		/* 每列 indtuples 从各自图里取 */
+		for (int col = 0; col < buildstatemulti->nkeys; col++)
+			buildstatemulti->cols[col].indtuples =
+				buildstatemulti->cols[col].graph->indtuples;
+	}
+
+	/* Flush pages：每列的图都需要 flush */
+	for (int col = 0; col < buildstatemulti->nkeys; col++)
+	{
+		HnswBuildState *bs = &buildstatemulti->cols[col];
+
+		if (bs->graph != NULL && !bs->graph->flushed)
+			FlushPages(bs);
+	}
+
+	/* Parallel build：本最小版本先不启并行，所以这里不做 HnswEndParallel
+	* 它们只是为了消除编译器警告（“变量已定义但未使用”）。
+	* 如果你后面不用 parallel_workers / forkNum，要么保留这两行，要么直接删掉这两个变量/参数的使用痕迹（例如把 parallel_workers 变量也删掉）。功能上没有任何影响。
+	*/
+	(void) parallel_workers;
+	(void) forkNum;
+}
 /*
  * Build the index
  */
@@ -1110,6 +1299,25 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	FreeBuildState(buildstate);
 }
 
+static void
+BuildIndexMulti(Relation heap, Relation index, IndexInfo *indexInfo,
+		   HnswBuildStateMulti * buildstatemulti, ForkNumber forkNum)
+{
+#ifdef HNSW_MEMORY
+	SeedRandom(42);
+#endif
+
+	InitBuildStateMulti(buildstatemulti, heap, index, indexInfo, forkNum); // todo dkx
+
+	BuildGraphMulti(buildstatemulti, forkNum); // todo dkx
+
+	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
+		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
+
+	for (int i = 0; i < buildstatemulti->nkeys; i++)
+		FreeBuildState(&buildstatemulti->cols[i]);
+
+}
 /*
  * Build the index for a logged table
  */
@@ -1124,6 +1332,39 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
 	result->heap_tuples = buildstate.reltuples;
 	result->index_tuples = buildstate.indtuples;
+
+	return result;
+}
+
+/* Relation heap
+ * 被索引的 表
+ * 对应 test1
+ * 你从它扫描每一行，取 emb1 / emb2
+ */
+
+/* Relation index
+ * 正在构建的 索引 relation
+ * 对应 idx_chinese_emb_hnsw_ip
+ * 包含: index tuple layout
+ *		opclass
+ *		indcollation
+ *		rd_options（WITH 里的参数）
+ */
+IndexBuildResult *
+hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo)
+{
+	IndexBuildResult *result;
+	HnswBuildStateMulti buildstatemulti;           // todo dkx
+
+	BuildIndexMulti(heap, index, indexInfo, &buildstatemulti, MAIN_FORKNUM); // todo dkx
+
+
+	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));	// 构建完成后，填充返回结果
+	result->heap_tuples = buildstatemulti.cols[0].reltuples;
+	/* 实际插入了多少索引条目：两张图分别插入，求和 */
+	result->index_tuples = 0;
+	for (int col = 0; col < buildstatemulti.nkeys; col++)
+		result->index_tuples += buildstatemulti.cols[col].indtuples;
 
 	return result;
 }

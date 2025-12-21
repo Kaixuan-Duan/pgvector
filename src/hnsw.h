@@ -183,6 +183,14 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+
+
+	// todo dkx
+	/* new: two-graph build options; 0 means “not provided” */
+	int   m1;
+	int   efConstruction1;
+	int   m2;
+	int   efConstruction2;
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -301,6 +309,19 @@ typedef struct HnswBuildState
 	char	   *hnswarea;
 }			HnswBuildState;
 
+typedef struct HnswBuildStateMulti
+{
+	/* 共享信息 */
+	Relation heap;
+	Relation index;
+	IndexInfo *indexInfo;
+	ForkNumber forkNum;
+
+	/* 多列 */
+	int nkeys;
+	HnswBuildState *cols;  /* [nkeys] */
+} HnswBuildStateMulti;
+
 typedef struct HnswMetaPageData
 {
 	uint32		magicNumber;
@@ -409,9 +430,12 @@ typedef struct HnswVacuumState
 
 /* Methods */
 int			HnswGetM(Relation index);
+int			HnswGetMColumn(Relation index, int col);
 int			HnswGetEfConstruction(Relation index);
+int			HnswGetEfConstructionColumn(Relation index, int col);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
+void		HnswInitSupportColumn(HnswSupport *support, Relation index, int col);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
@@ -440,6 +464,7 @@ void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElemen
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
+const		HnswTypeInfo *HnswGetTypeInfoColumn(Relation index, int col);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 
 /* Index access methods */
