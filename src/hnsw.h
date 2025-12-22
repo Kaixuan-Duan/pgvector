@@ -449,6 +449,8 @@ int			HnswGetMColumn(Relation index, int col);
 int			HnswGetEfConstruction(Relation index);
 int			HnswGetEfConstructionColumn(Relation index, int col);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
+FmgrInfo   *HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum);
+
 void		HnswInitSupport(HnswSupport * support, Relation index);
 void		HnswInitSupportColumn(HnswSupport *support, Relation index, int col);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
