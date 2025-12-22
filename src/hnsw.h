@@ -21,6 +21,7 @@
 #define HNSW_TYPE_INFO_PROC 3
 
 #define HNSW_VERSION	1
+#define HNSW_VERSION_MULTI  2
 #define HNSW_MAGIC_NUMBER 0xA953A953
 #define HNSW_PAGE_ID	0xFF90
 
@@ -67,6 +68,7 @@
 
 #define HnswPageGetOpaque(page)	((HnswPageOpaque) PageGetSpecialPointer(page))
 #define HnswPageGetMeta(page)	((HnswMetaPageData *) PageGetContents(page))
+#define HnswPageGetMetaMulti(page) ((HnswMetaPageDataMulti *) PageGetContents(page))
 
 #if PG_VERSION_NUM >= 150000
 #define RandomDouble() pg_prng_double(&pg_global_prng_state)
@@ -335,7 +337,20 @@ typedef struct HnswMetaPageData
 	BlockNumber insertPage;
 }			HnswMetaPageData;
 
+typedef struct HnswMetaPageDataMulti
+{
+	uint32      magicNumber;
+	uint32      version;
+
+	uint16      numGraphs;
+	uint16      reserved;
+
+	HnswMetaPageData graphs[2];
+} HnswMetaPageDataMulti;
+
+
 typedef HnswMetaPageData * HnswMetaPage;
+typedef HnswMetaPageDataMulti * HnswMetaPageMulti;
 
 typedef struct HnswPageOpaqueData
 {
@@ -444,12 +459,14 @@ void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+void		HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * q, Relation rel, HnswSupport * support, bool loadVec);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
+void		HnswUpdateMetaPageMulti(Relation index, int col, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
 void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
@@ -469,6 +486,8 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
+IndexBuildResult *hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo);
+
 void		hnswbuildempty(Relation index);
 bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
 #if PG_VERSION_NUM >= 140000

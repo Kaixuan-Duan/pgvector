@@ -102,6 +102,106 @@ CreateMetaPage(HnswBuildState * buildstate)
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
+/* todo dkx 不可删  关键点：buildstate 只是提供要写进去的值；覆盖发生是因为写目标（metapage block）是同一个。
+ * buf = HnswNewBuffer(index, forkNum);
+ * 这会在 index 文件里分配一个新 page（block）并返回 buffer
+ * 对于 HNSW 来说，第一次分配的 page 就是 metapage（通常就是 block 0 / HNSW_METAPAGE_BLKNO）
+ * 如果你在一个索引构建里调用两次 CreateMetaPage(bs)
+ * 第一次：分配了 block0，并写入 col0 的 meta
+ * 第二次：仍然会写 metapage block0（因为你的实现就是“写 metapage”，它没有“为第二列开一个新的 metapage block”的概念）
+ */
+static void
+CreateMetaPageMulti(HnswBuildStateMulti *mstate)
+{
+    Relation    index = mstate->index;
+    ForkNumber  forkNum = mstate->forkNum;
+    Buffer      buf;
+    Page        page;
+
+    buf = HnswNewBuffer(index, forkNum);
+    page = BufferGetPage(buf);
+    HnswInitPage(buf, page);
+
+    /* nkeys 只允许 1 或 2（因为你 multi 结构 graphs[2] 写死了） */
+    if (mstate->nkeys == 1)
+    {
+        /* ---- 写旧单列 metapage（完全复用原 CreateMetaPage 逻辑） ---- */
+        HnswBuildState *bs0 = &mstate->cols[0];
+        HnswMetaPage    metap = HnswPageGetMeta(page);
+
+        metap->magicNumber    = HNSW_MAGIC_NUMBER;
+        metap->version        = HNSW_VERSION;
+        metap->dimensions     = bs0->dimensions;
+        metap->m              = bs0->m;
+        metap->efConstruction = bs0->efConstruction;
+        metap->entryBlkno     = InvalidBlockNumber;
+        metap->entryOffno     = InvalidOffsetNumber;
+        metap->entryLevel     = -1;
+        metap->insertPage     = InvalidBlockNumber;
+
+        ((PageHeader) page)->pd_lower =
+            ((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
+
+        MarkBufferDirty(buf);
+        UnlockReleaseBuffer(buf);
+        return;
+    }
+    else if (mstate->nkeys == 2)
+    {
+        /* ---- 写新多列 metapage ---- */
+        HnswMetaPageMulti meta = HnswPageGetMetaMulti(page);
+
+        meta->magicNumber = HNSW_MAGIC_NUMBER;
+        meta->version     = HNSW_VERSION_MULTI;
+        meta->numGraphs   = 2;
+        meta->reserved    = 0;
+
+        /* graph 0 */
+        {
+            HnswBuildState   *bs = &mstate->cols[0];
+            HnswMetaPageData *g  = &meta->graphs[0];
+
+        	g->magicNumber    = HNSW_MAGIC_NUMBER;  /* 冗余字段，但写上更清晰 */
+        	g->version        = HNSW_VERSION;       /* 建议用“单列版本号”，表示每个 graph 槽位复用旧结构 */
+            g->dimensions     = bs->dimensions;
+            g->m              = bs->m;
+            g->efConstruction = bs->efConstruction;
+            g->entryBlkno     = InvalidBlockNumber;
+            g->entryOffno     = InvalidOffsetNumber;
+            g->entryLevel     = -1;
+            g->insertPage     = InvalidBlockNumber;
+        }
+
+        /* graph 1 */
+        {
+            HnswBuildState   *bs = &mstate->cols[1];
+            HnswMetaPageData *g  = &meta->graphs[1];
+
+        	g->magicNumber    = HNSW_MAGIC_NUMBER;  /* 冗余字段，但写上更清晰 */
+        	g->version        = HNSW_VERSION;       /* 建议用“单列版本号”，表示每个 graph 槽位复用旧结构 */
+            g->dimensions     = bs->dimensions;
+            g->m              = bs->m;
+            g->efConstruction = bs->efConstruction;
+            g->entryBlkno     = InvalidBlockNumber;
+            g->entryOffno     = InvalidOffsetNumber;
+            g->entryLevel     = -1;
+            g->insertPage     = InvalidBlockNumber;
+        }
+
+        ((PageHeader) page)->pd_lower =
+            ((char *) meta + sizeof(HnswMetaPageDataMulti)) - (char *) page;
+
+        MarkBufferDirty(buf);
+        UnlockReleaseBuffer(buf);
+        return;
+    }
+
+    /* 其它情况：直接不支持 */
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("hnsw multi metapage only supports 1 or 2 index columns (got %d)", mstate->nkeys)));
+}
+
 
 /*
  * Add a new page
@@ -234,6 +334,103 @@ CreateGraphPages(HnswBuildState * buildstate)
 	pfree(ntup);
 }
 
+static void
+CreateGraphPagesColumn(HnswBuildState *buildstate, int col)
+{
+    Relation     index = buildstate->index;
+    ForkNumber   forkNum = buildstate->forkNum;
+    Size         maxSize;
+    HnswElementTuple etup;
+    HnswNeighborTuple ntup;
+    BlockNumber  insertPage;
+    HnswElement  entryPoint;
+    Buffer       buf;
+    Page         page;
+    HnswElementPtr iter = buildstate->graph->head;
+    char        *base = buildstate->hnswarea;
+
+    maxSize = HNSW_MAX_SIZE;
+
+    etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+    ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+
+    buf = HnswNewBuffer(index, forkNum);
+    page = BufferGetPage(buf);
+    HnswInitPage(buf, page);
+
+    while (!HnswPtrIsNull(base, iter))
+    {
+        HnswElement element = HnswPtrAccess(base, iter);
+        Size        etupSize;
+        Size        ntupSize;
+        Size        combinedSize;
+        Pointer     valuePtr = HnswPtrAccess(base, element->value);
+
+        iter = element->next;
+
+        MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
+
+        etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+        ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+        combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+
+        if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("index tuple too large")));
+
+        HnswSetElementTuple(base, etup, element);
+
+        if (PageGetFreeSpace(page) < etupSize ||
+            (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
+            HnswBuildAppendPage(index, &buf, &page, forkNum);
+
+        element->blkno = BufferGetBlockNumber(buf);
+        element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
+        if (combinedSize <= maxSize)
+        {
+            element->neighborPage  = element->blkno;
+            element->neighborOffno = OffsetNumberNext(element->offno);
+        }
+        else
+        {
+            element->neighborPage  = element->blkno + 1;
+            element->neighborOffno = FirstOffsetNumber;
+        }
+
+        ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
+
+        if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+            elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+        if (PageGetFreeSpace(page) < ntupSize)
+            HnswBuildAppendPage(index, &buf, &page, forkNum);
+
+        if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+            elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+    }
+
+    insertPage = BufferGetBlockNumber(buf);
+
+    MarkBufferDirty(buf);
+    UnlockReleaseBuffer(buf);
+
+    entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
+
+    /*
+     * 关键改动：单列用 HnswUpdateMetaPage；多列必须写到 metapage 的 graphs[col]
+     * 你需要实现这个函数（或改造旧函数支持 col）
+     */
+    HnswUpdateMetaPageMulti(index, col,
+                            HNSW_UPDATE_ENTRY_ALWAYS,
+                            entryPoint, insertPage,
+                            forkNum, true);
+
+    pfree(etup);
+    pfree(ntup);
+}
+
+
 /*
  * Write neighbor tuples
  */
@@ -301,6 +498,34 @@ FlushPages(HnswBuildState * buildstate)
 	buildstate->graph->flushed = true;
 	MemoryContextReset(buildstate->graphCtx);
 }
+
+// todo dkx ok
+static void
+FlushPagesMulti(HnswBuildStateMulti *mstate)
+{
+#ifdef HNSW_MEMORY
+    for (int col = 0; col < mstate->nkeys; col++)
+        elog(INFO, "memory col%d: %zu MB",
+             col + 1, mstate->cols[col].graph->memoryUsed / (1024 * 1024));
+#endif
+
+    /* 关键：写 metapage（旧/新布局由 nkeys 决定） */
+    CreateMetaPageMulti(mstate);
+
+    /* 每列各自落盘自己的图结构 */
+    for (int col = 0; col < mstate->nkeys; col++)
+    {
+        HnswBuildState *bs = &mstate->cols[col];
+
+        // CreateGraphPages(bs);
+    	CreateGraphPagesColumn(bs, col);
+        WriteNeighborTuples(bs);
+
+        bs->graph->flushed = true;
+        MemoryContextReset(bs->graphCtx);
+    }
+}
+
 
 /*
  * Add a heap TID to an existing element
@@ -646,6 +871,7 @@ BuildCallbackMulti(Relation index, ItemPointer tid, Datum *values,
 /*
  * Initialize the graph
  */
+// todo dkx
 static void
 InitGraph(HnswGraph * graph, char *base, Size memoryTotal)
 {
@@ -1372,6 +1598,7 @@ hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo)
 /*
  * Build the index for an unlogged table
  */
+// todo dkx
 void
 hnswbuildempty(Relation index)
 {

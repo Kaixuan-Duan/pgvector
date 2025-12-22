@@ -686,6 +686,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 /*
  * Insert a tuple into the index
  */
+// todo dkx
 bool
 HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
 {
