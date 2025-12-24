@@ -683,6 +683,53 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, building);
 }
 
+
+static void
+UpdateGraphOnDiskMulti(Relation index, HnswSupport *support,
+					   HnswElement element, int m, int efConstruction,
+					   HnswElement entryPoint, bool building, int col)
+{
+	BlockNumber newInsertPage = InvalidBlockNumber;
+
+	/* 旧布局兼容：单列索引仍然走原版 */
+	if (col == 0 && IndexRelationGetNumberOfKeyAttributes(index) == 1)
+	{
+		UpdateGraphOnDisk(index, support, element, m, efConstruction, entryPoint, building);
+		return;
+	}
+
+	/* Look for duplicate (按列查重，否则会跨列误判/误去重) */
+	if (FindDuplicateOnDiskColumn(index, element, building, col))
+		return;
+
+	/* Add element (按列选择 insert page / 分配策略，否则不同列会写到同一套页面上) */
+	AddElementOnDiskColumn(index, element, m,
+						   GetInsertPageColumn(index, col),
+						   &newInsertPage, building, col);
+
+	/* Update insert page if needed (按列更新 metapage 中的 insertPage[col]) */
+	if (BlockNumberIsValid(newInsertPage))
+		HnswUpdateMetaPageColumn(index, col,
+								 0 /* flags */,
+								 NULL /* entry */,
+								 newInsertPage,
+								 MAIN_FORKNUM, building);
+
+	/* Update neighbors (按列更新邻接边对应的页面/偏移) */
+	HnswUpdateNeighborsOnDiskColumn(index, support, element, m,
+									false /* lockNeighbors */,
+									building, col);
+
+	/* Update entry point if needed (按列更新 metapage 中的 entryPoint[col]) */
+	if (entryPoint == NULL || element->level > entryPoint->level)
+		HnswUpdateMetaPageColumn(index, col,
+								 HNSW_UPDATE_ENTRY_GREATER,
+								 element,
+								 InvalidBlockNumber,
+								 MAIN_FORKNUM, building);
+}
+
+
 /*
  * Insert a tuple into the index
  */
@@ -736,6 +783,61 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 
 	return true;
 }
+
+bool
+HnswInsertTupleOnDiskMulti(Relation index, HnswSupport *support,
+						   Datum value, ItemPointer heaptid,
+						   bool building, int col)
+{
+	HnswElement  entryPoint;
+	HnswElement  element;
+	int          m;
+	int          efConstruction = HnswGetEfConstructionColumn(index, col);
+	LOCKMODE     lockmode = ShareLock;
+	char        *base = NULL;
+
+	/*
+	 * 仍然使用同一个 UPDATE_LOCK 页来保护“磁盘图更新”：
+	 * - 最小改动、最安全（所有列的 on-disk 更新串行）
+	 * - 兼容旧版 vacuum/repair 对这个锁的假设
+	 */
+	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
+
+	/* 按列读取 m 与 entryPoint（从 col 的 metapage/元信息中读取） */
+	HnswGetMetaPageInfoMulti(index, col, &m, &entryPoint);
+
+	/* Create an element (same as original) */
+	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
+	HnswPtrStore(base, element->value, DatumGetPointer(value));
+
+	/* Prevent concurrent inserts when likely updating entry point */
+	if (entryPoint == NULL || element->level > entryPoint->level)
+	{
+		/* Release shared lock */
+		UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
+
+		/* Get exclusive lock */
+		lockmode = ExclusiveLock;
+		LockPage(index, HNSW_UPDATE_LOCK, lockmode);
+
+		/* 重新按列读取最新 entry point */
+		entryPoint = HnswGetEntryPointColumn(index, col);
+	}
+
+	/* Find neighbors for element (support 已经是按列初始化的即可复用) */
+	HnswFindElementNeighbors(base, element, entryPoint, index,
+							 support, m, efConstruction, false);
+
+	/* Update graph on disk (关键：按列写盘，避免不同列互相覆盖/串图) */
+	UpdateGraphOnDiskMulti(index, support, element, m, efConstruction,
+						   entryPoint, building, col);
+
+	/* Release lock */
+	UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
+
+	return true;
+}
+
 
 /*
  * Insert a tuple into the index

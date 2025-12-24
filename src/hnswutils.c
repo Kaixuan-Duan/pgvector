@@ -473,6 +473,22 @@ HnswGetEntryPoint(Relation index)
 	return entryPoint;
 }
 
+HnswElement
+HnswGetEntryPointColumn(Relation index, int col)
+{
+	HnswElement entryPoint;
+
+	/* 旧布局兼容：单列索引仍然走原版 */
+	if (col == 0 && IndexRelationGetNumberOfKeyAttributes(index) == 1)
+		return HnswGetEntryPoint(index);
+
+	/* 新布局：按列从 multi metapage 取 entrypoint */
+	HnswGetMetaPageInfoMulti(index, col, NULL, &entryPoint);
+
+	return entryPoint;
+}
+
+
 /*
  * Update the metapage info
  */

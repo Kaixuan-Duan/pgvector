@@ -460,6 +460,8 @@ void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
+HnswElement HnswGetEntryPointColumn(Relation index, int col);
+
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void		HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);

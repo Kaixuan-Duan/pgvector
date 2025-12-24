@@ -694,6 +694,7 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 /*
  * Insert tuple
  */
+// todo dkx
 static bool
 InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate)
 {
@@ -784,6 +785,151 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	return true;
 }
 
+
+static inline bool
+HnswUseMultiLayout(Relation index, HnswBuildStateMulti *mstate)
+{
+    /* 最小判定：nkeys>1 => 新布局；否则旧布局 */
+    int nkeys = (mstate != NULL) ? mstate->nkeys : IndexRelationGetNumberOfKeyAttributes(index);
+    return (nkeys > 1);
+}
+
+/*
+ * 统一入口：兼容旧布局(单列) + 新布局(多列)
+ * - 单列调用：InsertTupleMulti(index, values, isnull, tid, buildstate, NULL, 0)
+ * - 多列调用：InsertTupleMulti(index, vals1, nulls1, tid, &mstate->cols[col], mstate, col)
+ */
+static bool
+InsertTupleMulti(Relation index, Datum *values, bool *isnull,
+                 ItemPointer heaptid, HnswBuildState *buildstate,
+                 HnswBuildStateMulti *mstate, int col)
+{
+    HnswGraph      *graph = buildstate->graph;
+    HnswElement     element;
+    HnswAllocator  *allocator = &buildstate->allocator;
+    HnswSupport    *support = &buildstate->support;
+    Size            valueSize;
+    Pointer         valuePtr;
+    LWLock         *flushLock = &graph->flushLock;
+    char           *base = buildstate->hnswarea;
+    Datum           value;
+    bool            multi = HnswUseMultiLayout(index, mstate);
+
+    /* Form index value */
+    if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
+        return false;
+
+    /* Get datum size */
+    valueSize = VARSIZE_ANY(DatumGetPointer(value));
+
+    /* Ensure graph not flushed when inserting */
+    LWLockAcquire(flushLock, LW_SHARED);
+
+    /* Are we in the on-disk phase? */
+    if (graph->flushed)
+    {
+        LWLockRelease(flushLock);
+
+        if (multi)
+            return HnswInsertTupleOnDiskMulti(index, support, value, heaptid, true, col);
+        else
+            return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+    }
+
+    /* Coordinate allocator (same as original) */
+    LWLockAcquire(&graph->allocatorLock, LW_EXCLUSIVE);
+
+    /* Memory check (same trigger point as original) */
+    if (graph->memoryUsed >= graph->memoryTotal)
+    {
+        LWLockRelease(&graph->allocatorLock);
+
+        LWLockRelease(flushLock);
+
+        if (multi)
+        {
+            /*
+             * 多列：最小做法是“一旦任意列超内存，就刷盘整个 multi”，
+             * 保证所有列同时进入 on-disk phase，避免布局/状态不一致。
+             *
+             * 这里建议拿一个“全局/统一”的 flush 同步锁来包住 FlushPagesMulti，
+             * 但你当前版本不启并行的话，最小实现也可以先不引入额外锁。
+             *
+             * 为了尽量接近原版语义，这里仍然拿回当前列的 flushLock(EXCLUSIVE)
+             * 再 flush，防止同列并发（即使你现在没并行）。
+             */
+            LWLockAcquire(flushLock, LW_EXCLUSIVE);
+
+            if (!graph->flushed)
+            {
+                ereport(NOTICE,
+                        (errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples",
+                                (int64) graph->indtuples),
+                         errdetail("Building will take significantly more time."),
+                         errhint("Increase maintenance_work_mem to speed up builds.")));
+
+                /*
+                 * 关键变化：不要 FlushPages(buildstate)（单列刷盘会破坏多列布局）
+                 * 改为 FlushPagesMulti(mstate)
+                 */
+                if (mstate == NULL)
+                    elog(ERROR, "multi layout requires buildstatemulti state");
+
+                FlushPagesMulti(mstate);
+            }
+
+            LWLockRelease(flushLock);
+
+            /* flush 后必然走 on-disk insert（新布局要带 col） */
+            return HnswInsertTupleOnDiskMulti(index, support, value, heaptid, true, col);
+        }
+        else
+        {
+            /* 旧布局：保持原行为 */
+            LWLockAcquire(flushLock, LW_EXCLUSIVE);
+
+            if (!graph->flushed)
+            {
+                ereport(NOTICE,
+                        (errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples",
+                                (int64) graph->indtuples),
+                         errdetail("Building will take significantly more time."),
+                         errhint("Increase maintenance_work_mem to speed up builds.")));
+
+                FlushPages(buildstate);
+            }
+
+            LWLockRelease(flushLock);
+
+            return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+        }
+    }
+
+    /* Ok, we can proceed to allocate the element (same as original) */
+    element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml,
+                             buildstate->maxLevel, allocator);
+    valuePtr = HnswAlloc(allocator, valueSize);
+
+    /* Done allocating; release allocator lock */
+    LWLockRelease(&graph->allocatorLock);
+
+    /* Copy the datum */
+    memcpy(valuePtr, DatumGetPointer(value), valueSize);
+    HnswPtrStore(base, element->value, valuePtr);
+
+    /* Create a lock for the element */
+    LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
+
+    /* Insert tuple in-memory */
+    InsertTupleInMemory(buildstate, element);
+
+    /* Release flush lock */
+    LWLockRelease(flushLock);
+
+    return true;
+}
+
+
 /*
  * Callback for table_index_build_scan
  */
@@ -846,7 +992,7 @@ BuildCallbackMulti(Relation index, ItemPointer tid, Datum *values,
 		vals1[0] = values[col];
 		nulls1[0] = false;
 
-		if (InsertTuple(index, vals1, nulls1, tid, buildstate))
+		if (InsertTupleMulti(index, vals1, nulls1, tid, buildstate, mstate, col))
 		{
 			/* Update progress: each successful insert increments this graph's indtuples */
 			SpinLockAcquire(&graph->lock);
@@ -1488,14 +1634,28 @@ BuildGraphMulti(HnswBuildStateMulti * buildstatemulti, ForkNumber forkNum)
 				buildstatemulti->cols[col].graph->indtuples;
 	}
 
-	/* Flush pages：每列的图都需要 flush */
+	// /* Flush pages：每列的图都需要 flush */
+	// for (int col = 0; col < buildstatemulti->nkeys; col++)
+	// {
+	// 	HnswBuildState *bs = &buildstatemulti->cols[col];
+	//
+	// 	if (bs->graph != NULL && !bs->graph->flushed)
+	// 		FlushPages(bs);
+	// }
+	/* Flush pages：任意一列没 flushed，就统一 flush multi */
+	bool need_flush = false;
 	for (int col = 0; col < buildstatemulti->nkeys; col++)
 	{
 		HnswBuildState *bs = &buildstatemulti->cols[col];
 
 		if (bs->graph != NULL && !bs->graph->flushed)
-			FlushPages(bs);
+		{
+			need_flush = true;
+			break;
+		}
 	}
+	if (need_flush)
+		FlushPagesMulti(buildstatemulti);
 
 	/* Parallel build：本最小版本先不启并行，所以这里不做 HnswEndParallel
 	* 它们只是为了消除编译器警告（“变量已定义但未使用”）。
