@@ -32,6 +32,60 @@ GetInsertPage(Relation index)
 	return insertPage;
 }
 
+static BlockNumber
+GetInsertPageColumn(Relation index, int col)
+{
+    Buffer      buf;
+    Page        page;
+    HnswMetaPage metap; /* 先用旧结构读头 */
+    BlockNumber insertPage;
+
+    buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+
+    metap = HnswPageGetMeta(page);
+
+    if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
+        elog(ERROR, "hnsw index is not valid");
+
+    /* 旧布局：只有一棵图 */
+    if (metap->version == HNSW_VERSION)
+    {
+        if (col != 0)
+            elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
+
+        insertPage = metap->insertPage;
+
+        UnlockReleaseBuffer(buf);
+        return insertPage;
+    }
+
+    /* 新布局：多图 */
+    if (metap->version == HNSW_VERSION_MULTI)
+    {
+        HnswMetaPageMulti meta2 = HnswPageGetMetaMulti(page);
+
+        if (unlikely(meta2->magicNumber != HNSW_MAGIC_NUMBER))
+            elog(ERROR, "hnsw index is not valid (multi metapage)");
+        if (meta2->numGraphs != 2 && meta2->numGraphs != 1)
+            elog(ERROR, "hnsw multi metapage has invalid numGraphs=%hu", meta2->numGraphs);
+
+        if (col < 0 || col >= meta2->numGraphs)
+            elog(ERROR, "hnsw multi metapage col out of range: col=%d numGraphs=%u",
+                 col, meta2->numGraphs);
+
+        insertPage = meta2->graphs[col].insertPage;
+
+        UnlockReleaseBuffer(buf);
+        return insertPage;
+    }
+
+    UnlockReleaseBuffer(buf);
+    elog(ERROR, "hnsw metapage has unknown version: %u", metap->version);
+}
+
+
 /*
  * Check for a free offset
  */
@@ -699,30 +753,30 @@ UpdateGraphOnDiskMulti(Relation index, HnswSupport *support,
 	}
 
 	/* Look for duplicate (按列查重，否则会跨列误判/误去重) */
-	if (FindDuplicateOnDiskColumn(index, element, building, col))
+	if (FindDuplicateOnDisk(index, element, building))
 		return;
 
 	/* Add element (按列选择 insert page / 分配策略，否则不同列会写到同一套页面上) */
-	AddElementOnDiskColumn(index, element, m,
+	AddElementOnDisk(index, element, m,
 						   GetInsertPageColumn(index, col),
-						   &newInsertPage, building, col);
+						   &newInsertPage, building);
 
 	/* Update insert page if needed (按列更新 metapage 中的 insertPage[col]) */
 	if (BlockNumberIsValid(newInsertPage))
-		HnswUpdateMetaPageColumn(index, col,
+		HnswUpdateMetaPageMulti(index, col,
 								 0 /* flags */,
 								 NULL /* entry */,
 								 newInsertPage,
 								 MAIN_FORKNUM, building);
 
 	/* Update neighbors (按列更新邻接边对应的页面/偏移) */
-	HnswUpdateNeighborsOnDiskColumn(index, support, element, m,
+	HnswUpdateNeighborsOnDisk(index, support, element, m,
 									false /* lockNeighbors */,
 									building, col);
 
 	/* Update entry point if needed (按列更新 metapage 中的 entryPoint[col]) */
 	if (entryPoint == NULL || element->level > entryPoint->level)
-		HnswUpdateMetaPageColumn(index, col,
+		HnswUpdateMetaPageMulti(index, col,
 								 HNSW_UPDATE_ENTRY_GREATER,
 								 element,
 								 InvalidBlockNumber,

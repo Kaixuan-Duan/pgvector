@@ -524,42 +524,62 @@ HnswUpdateMetaPageInfoColumn(Page page, int col,
 							 BlockNumber insertPage)
 {
 	/* 先用旧头读 magic/version：multi 布局开头也放这些字段，所以安全 */
-	HnswMetaPageData *head = HnswPageGetMeta(page);
+    HnswMetaPage head = HnswPageGetMeta(page);
 
-	if (unlikely(head->magicNumber != HNSW_MAGIC_NUMBER))
-		elog(ERROR, "hnsw index is not valid");
+    if (unlikely(head->magicNumber != HNSW_MAGIC_NUMBER))
+        elog(ERROR, "hnsw index is not valid");
 
-	if (head->version != HNSW_VERSION_MULTI)
-		elog(ERROR, "hnsw metapage is not multi layout (version=%u)", head->version);
+    /* 旧布局：单列索引，col 只能是 0，直接复用原版 helper */
+    if (head->version == HNSW_VERSION)
+    {
+        if (col != 0)
+            elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
 
-	HnswMetaPageMulti meta = HnswPageGetMetaMulti(page);
+        HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
+        return;
+    }
 
-	if (col < 0 || col >= meta->numGraphs)
-		elog(ERROR, "hnsw multi metapage col out of range: col=%d numGraphs=%u",
-			 col, meta->numGraphs);
 
-	HnswMetaPageData *g = &meta->graphs[col];
 
-	/* === 完全复刻原版 HnswUpdateMetaPageInfo 语义 === */
-	if (updateEntry)
-	{
-		if (entryPoint == NULL)
-		{
-			g->entryBlkno = InvalidBlockNumber;
-			g->entryOffno = InvalidOffsetNumber;
-			g->entryLevel = -1;
-		}
-		else if (entryPoint->level > g->entryLevel ||
-				 updateEntry == HNSW_UPDATE_ENTRY_ALWAYS)
-		{
-			g->entryBlkno = entryPoint->blkno;
-			g->entryOffno = entryPoint->offno;
-			g->entryLevel = entryPoint->level;
-		}
-	}
+	    /* 新布局：多图 */
+    if (head->version == HNSW_VERSION_MULTI)
+    {
+        HnswMetaPageMulti meta = HnswPageGetMetaMulti(page);
 
-	if (BlockNumberIsValid(insertPage))
-		g->insertPage = insertPage;
+        if (meta->numGraphs != 2 && meta->numGraphs != 1)
+            elog(ERROR, "hnsw multi metapage has invalid numGraphs=%hu", meta->numGraphs);
+
+        if (col < 0 || col >= meta->numGraphs)
+            elog(ERROR, "hnsw multi metapage col out of range: col=%d numGraphs=%u",
+                 col, meta->numGraphs);
+
+        HnswMetaPageData *g = &meta->graphs[col];
+
+        /* === 完全复刻原版 HnswUpdateMetaPageInfo 语义 === */
+        if (updateEntry)
+        {
+            if (entryPoint == NULL)
+            {
+                g->entryBlkno = InvalidBlockNumber;
+                g->entryOffno = InvalidOffsetNumber;
+                g->entryLevel = -1;
+            }
+            else if (entryPoint->level > g->entryLevel ||
+                     updateEntry == HNSW_UPDATE_ENTRY_ALWAYS)
+            {
+                g->entryBlkno = entryPoint->blkno;
+                g->entryOffno = entryPoint->offno;
+                g->entryLevel = entryPoint->level;
+            }
+        }
+
+        if (BlockNumberIsValid(insertPage))
+            g->insertPage = insertPage;
+
+        return;
+    }
+
+    elog(ERROR, "hnsw metapage has unknown version: %u", head->version);
 }
 
 /*
