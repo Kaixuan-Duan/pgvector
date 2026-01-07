@@ -772,7 +772,7 @@ UpdateGraphOnDiskMulti(Relation index, HnswSupport *support,
 	/* Update neighbors (按列更新邻接边对应的页面/偏移) */
 	HnswUpdateNeighborsOnDisk(index, support, element, m,
 									false /* lockNeighbors */,
-									building, col);
+									building);
 
 	/* Update entry point if needed (按列更新 metapage 中的 entryPoint[col]) */
 	if (entryPoint == NULL || element->level > entryPoint->level)
