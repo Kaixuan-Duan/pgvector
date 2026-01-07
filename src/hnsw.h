@@ -493,8 +493,13 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
 IndexBuildResult *hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo);
+IndexBuildResult *hnswbuild_dispatch(Relation heap, Relation index, IndexInfo *indexInfo);
+
 
 void		hnswbuildempty(Relation index);
+void		hnswbuildemptymulti(Relation index);
+void		hnswbuildempty_dispatch(Relation index);
+
 bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
 #if PG_VERSION_NUM >= 140000
 					   ,bool indexUnchanged

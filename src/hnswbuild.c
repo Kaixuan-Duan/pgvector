@@ -1755,6 +1755,20 @@ hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo)
 	return result;
 }
 
+IndexBuildResult *
+hnswbuild_dispatch(Relation heap, Relation index, IndexInfo *indexInfo)
+{
+	int nkeys;
+
+	/* 以 key attrs 为准（不把 INCLUDE 算进去） */
+	nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	if (nkeys <= 1)
+		return hnswbuild(heap, index, indexInfo);
+	else
+		return hnswbuildmulti(heap, index, indexInfo);
+}
+
 /*
  * Build the index for an unlogged table
  */
@@ -1766,4 +1780,34 @@ hnswbuildempty(Relation index)
 	HnswBuildState buildstate;
 
 	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM);
+}
+
+/*
+ * Build the index for an unlogged table (multi-column)
+ */
+void
+hnswbuildemptymulti(Relation index)
+{
+	IndexInfo *indexInfo = BuildIndexInfo(index);
+	HnswBuildStateMulti buildstatemulti;
+
+	MemSet(&buildstatemulti, 0, sizeof(buildstatemulti));
+
+	/* heap == NULL, INIT_FORKNUM: initialize empty index structure */
+	BuildIndexMulti(NULL, index, indexInfo, &buildstatemulti, INIT_FORKNUM);
+
+	/* 注意：BuildIndexMulti 里需要负责释放 buildstatemulti->cols 数组本身 */
+}
+
+
+void
+hnswbuildempty_dispatch(Relation index)
+{
+	IndexInfo *indexInfo = BuildIndexInfo(index);
+	int nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	if (nkeys <= 1)
+		hnswbuildempty(index);       /* 原版函数：保持不改名 */
+	else
+		hnswbuildemptymulti(index);  /* 新增 multi */
 }

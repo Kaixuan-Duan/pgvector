@@ -331,28 +331,28 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->amkeytype = InvalidOid;
 
 	/* Interface functions */
-	amroutine->ambuild = hnswbuild;			// todo dkx
-	amroutine->ambuildempty = hnswbuildempty;
-	amroutine->aminsert = hnswinsert;
+	amroutine->ambuild = hnswbuild_dispatch;	//hnswbuild;				// todo dkx ok
+	amroutine->ambuildempty = hnswbuildempty_dispatch; //hnswbuildempty;	// todo dkx ok
+	amroutine->aminsert = hnswinsert;										// todo dkx
 #if PG_VERSION_NUM >= 170000
 	amroutine->aminsertcleanup = NULL;
 #endif
-	amroutine->ambulkdelete = hnswbulkdelete;
-	amroutine->amvacuumcleanup = hnswvacuumcleanup;
+	amroutine->ambulkdelete = hnswbulkdelete;								// todo dkx
+	amroutine->amvacuumcleanup = hnswvacuumcleanup;							// todo dkx
 	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = hnswcostestimate;
-	amroutine->amoptions = hnswoptions;		// todo dkx ok
+	amroutine->amcostestimate = hnswcostestimate;							// todo dkx
+	amroutine->amoptions = hnswoptions;										// todo dkx ok
 	amroutine->amproperty = NULL;	/* TODO AMPROP_DISTANCE_ORDERABLE */
 	amroutine->ambuildphasename = hnswbuildphasename;
-	amroutine->amvalidate = hnswvalidate;				// todo dkx ok
+	amroutine->amvalidate = hnswvalidate;									// todo dkx ok
 #if PG_VERSION_NUM >= 140000
 	amroutine->amadjustmembers = NULL;
 #endif
-	amroutine->ambeginscan = hnswbeginscan;
-	amroutine->amrescan = hnswrescan;
-	amroutine->amgettuple = hnswgettuple;
+	amroutine->ambeginscan = hnswbeginscan;									// todo dkx
+	amroutine->amrescan = hnswrescan;										// todo dkx
+	amroutine->amgettuple = hnswgettuple;									// todo dkx
 	amroutine->amgetbitmap = NULL;
-	amroutine->amendscan = hnswendscan;
+	amroutine->amendscan = hnswendscan;										// todo dkx
 	amroutine->ammarkpos = NULL;
 	amroutine->amrestrpos = NULL;
 
