@@ -333,7 +333,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 	/* Interface functions */
 	amroutine->ambuild = hnswbuild_dispatch;	//hnswbuild;				// todo dkx ok
 	amroutine->ambuildempty = hnswbuildempty_dispatch; //hnswbuildempty;	// todo dkx ok
-	amroutine->aminsert = hnswinsert;										// todo dkx
+	amroutine->aminsert = hnswinsert_dispatch;  //hnswinsert;				// todo dkx ok
 #if PG_VERSION_NUM >= 170000
 	amroutine->aminsertcleanup = NULL;
 #endif

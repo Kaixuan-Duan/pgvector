@@ -913,6 +913,37 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 }
 
 /*
+ * Insert one column's value into its corresponding HNSW graph
+ * col: 0-based column index (0 for first key, 1 for second key, ...)
+ */
+static void
+HnswInsertTupleColumn(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, int col)
+{
+	Datum value;
+	const HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
+	HnswSupport support;
+
+	/* Skip null for this column */
+	if (isnull[col])
+		return;
+
+	/*
+	 * IMPORTANT:
+	 * Init support must be column-aware (attno = col + 1),
+	 * because different index columns can have different opclass/procs.
+	 */
+	HnswInitSupportColumn(&support, index, col);  /* 你需要提供这个函数 */
+
+	/* Reuse the original value-forming logic by slicing arrays */
+	if (!HnswFormIndexValue(&value, &values[col], &isnull[col], typeInfo, &support))
+		return;
+
+	/* Insert into the on-disk graph for this column */
+	HnswInsertTupleOnDiskMulti(index, &support, value, heaptid, false, col);
+}
+
+
+/*
  * Insert a tuple into the index
  */
 bool
@@ -945,4 +976,83 @@ hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	MemoryContextDelete(insertCtx);
 
 	return false;
+}
+
+
+/*
+ * Insert a tuple into the index (multi-column)
+ */
+bool
+hnswinsertmulti(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
+				Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+				, bool indexUnchanged
+#endif
+				, IndexInfo *indexInfo
+)
+{
+	MemoryContext oldCtx;
+	MemoryContext insertCtx;
+	int nkeys;
+	bool any = false;
+
+	/* 只看 key attrs，不把 INCLUDE 算进去 */
+	nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	/* 所有 key 列都 NULL：直接跳过 */
+	for (int col = 0; col < nkeys; col++)
+	{
+		if (!isnull[col])
+		{
+			any = true;
+			break;
+		}
+	}
+	if (!any)
+		return false;
+
+	/* Create memory context */
+	insertCtx = AllocSetContextCreate(CurrentMemoryContext,
+									  "Hnsw insert temporary context",
+									  ALLOCSET_DEFAULT_SIZES);
+	oldCtx = MemoryContextSwitchTo(insertCtx);
+
+	/*
+	 * 对每一列独立插入对应的图
+	 */
+	for (int col = 0; col < nkeys; col++)
+		HnswInsertTupleColumn(index, values, isnull, heap_tid, col);
+
+	/* Delete memory context */
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextDelete(insertCtx);
+
+	return false;
+}
+
+
+
+bool
+hnswinsert_dispatch(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
+					Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+					, bool indexUnchanged
+#endif
+					, IndexInfo *indexInfo
+)
+{
+	int nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	if (nkeys <= 1)
+		return hnswinsert(index, values, isnull, heap_tid, heap, checkUnique
+#if PG_VERSION_NUM >= 140000
+						  , indexUnchanged
+#endif
+						  , indexInfo);
+	else
+		return hnswinsertmulti(index, values, isnull, heap_tid, heap, checkUnique
+#if PG_VERSION_NUM >= 140000
+							   , indexUnchanged
+#endif
+							   , indexInfo);
 }

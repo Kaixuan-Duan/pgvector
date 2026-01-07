@@ -506,6 +506,19 @@ bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_t
 #endif
 					   ,IndexInfo *indexInfo
 );
+bool		hnswinsertmulti(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+					   ,bool indexUnchanged
+#endif
+					   ,IndexInfo *indexInfo
+);
+bool		hnswinsert_dispatch(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+					   ,bool indexUnchanged
+#endif
+					   ,IndexInfo *indexInfo
+);
+
 IndexBulkDeleteResult *hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
 IndexBulkDeleteResult *hnswvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
 IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
