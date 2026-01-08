@@ -524,3 +524,48 @@ hnswendscan(IndexScanDesc scan)
 	pfree(so);
 	scan->opaque = NULL;
 }
+
+/*
+ * End a scan and release resources (multi-column)
+ */
+void
+hnswendscanmulti(IndexScanDesc scan)
+{
+	HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+
+	if (soMulti == NULL)
+		return;
+
+	if (soMulti->cols != NULL)
+	{
+		for (int i = 0; i < soMulti->nkeys; i++)
+		{
+			HnswScanOpaque so = &soMulti->cols[i];
+
+			if (so->tmpCtx != NULL)
+			{
+				MemoryContextDelete(so->tmpCtx);
+				so->tmpCtx = NULL;
+			}
+		}
+
+		pfree(soMulti->cols);
+		soMulti->cols = NULL;
+	}
+
+	pfree(soMulti);
+	scan->opaque = NULL;
+}
+
+
+void
+hnswendscan_dispatch(IndexScanDesc scan)
+{
+	int nkeys_index = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
+
+	if (nkeys_index <= 1)
+		hnswendscan(scan);
+	else
+		hnswendscanmulti(scan);
+}
+

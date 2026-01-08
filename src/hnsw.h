@@ -558,6 +558,9 @@ bool		hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir);
 bool		hnswgettuple_dispatch(IndexScanDesc scan, ScanDirection dir);
 
 void		hnswendscan(IndexScanDesc scan);
+void		hnswendscanmulti(IndexScanDesc scan);
+void		hnswendscan_dispatch(IndexScanDesc scan);
+
 
 static inline HnswNeighborArray *
 HnswGetNeighbors(char *base, HnswElement element, int lc)

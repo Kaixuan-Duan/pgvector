@@ -474,11 +474,14 @@ hnswhandler(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 140000
 	amroutine->amadjustmembers = NULL;
 #endif
+	/*
+	 *你之前的崩溃（enable_seqscan=off 后 server crash）主要还是 scan/gettuple/读取 metapage/graph 布局的问题
+	 */
 	amroutine->ambeginscan = hnswbeginscan_dispatch;						// todo dkx ok
 	amroutine->amrescan = hnswrescan_dispatch;								// todo dkx ok
 	amroutine->amgettuple = hnswgettuple_dispatch;							// todo dkx ok
 	amroutine->amgetbitmap = NULL;
-	amroutine->amendscan = hnswendscan;										// todo dkx
+	amroutine->amendscan = hnswendscan_dispatch;							// todo dkx ok
 	amroutine->ammarkpos = NULL;
 	amroutine->amrestrpos = NULL;
 
