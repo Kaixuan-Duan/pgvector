@@ -462,6 +462,8 @@ List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Re
 HnswElement HnswGetEntryPoint(Relation index);
 HnswElement HnswGetEntryPointColumn(Relation index, int col);
 
+BlockNumber HnswGetHeadBlockColumn(Relation index, int col);
+
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void		HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
@@ -520,6 +522,9 @@ bool		hnswinsert_dispatch(Relation index, Datum *values, bool *isnull, ItemPoint
 );
 
 IndexBulkDeleteResult *hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
+IndexBulkDeleteResult *hnswbulkdeletemulti(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
+IndexBulkDeleteResult *hnswbulkdelete_dispatch(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
+
 IndexBulkDeleteResult *hnswvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
 IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);

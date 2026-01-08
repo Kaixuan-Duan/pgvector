@@ -337,7 +337,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 170000
 	amroutine->aminsertcleanup = NULL;
 #endif
-	amroutine->ambulkdelete = hnswbulkdelete;								// todo dkx
+	amroutine->ambulkdelete = hnswbulkdelete_dispatch;   //hnswbulkdelete;	// todo dkx ok
 	amroutine->amvacuumcleanup = hnswvacuumcleanup;							// todo dkx
 	amroutine->amcanreturn = NULL;
 	amroutine->amcostestimate = hnswcostestimate;							// todo dkx

@@ -489,6 +489,100 @@ HnswGetEntryPointColumn(Relation index, int col)
 }
 
 
+BlockNumber
+HnswGetHeadBlockColumn(Relation index, int col)
+{
+    Buffer buf;
+    Page page;
+    HnswMetaPage metap;
+    BlockNumber head;
+
+    buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+
+    metap = HnswPageGetMeta(page);
+
+    if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
+    {
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        elog(ERROR, "hnsw index is not valid");
+    }
+
+    /* 旧布局：只有一张图，起点就是固定的 HNSW_HEAD_BLKNO */
+    if (metap->version == HNSW_VERSION)
+    {
+        if (col != 0)
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
+        }
+
+        head = HNSW_HEAD_BLKNO;
+
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        return head;
+    }
+
+    /* 新布局：从 multi metapage 里取该列的 insertPage 作为遍历起点 */
+    if (metap->version == HNSW_VERSION_MULTI)
+    {
+        HnswMetaPageMulti meta2 = HnswPageGetMetaMulti(page);
+
+        if (unlikely(meta2->magicNumber != HNSW_MAGIC_NUMBER))
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw index is not valid (multi metapage)");
+        }
+
+        if (meta2->numGraphs != 2 && meta2->numGraphs != 1)
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw multi metapage has invalid numGraphs=%hu", meta2->numGraphs);
+        }
+
+        if (col < 0 || col >= meta2->numGraphs)
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw multi metapage col out of range: col=%d numGraphs=%u",
+                 col, meta2->numGraphs);
+        }
+
+        head = meta2->graphs[col].insertPage;
+
+        /* 你要求补的校验 */
+        if (!BlockNumberIsValid(head))
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw multi metapage has invalid head/insertPage for col=%d", col);
+        }
+
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        return head;
+    }
+
+    /* 未知版本 */
+    {
+        uint32 ver = metap->version;
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        elog(ERROR, "hnsw metapage has unknown version: %u", ver);
+    }
+
+    return InvalidBlockNumber; /* unreachable */
+}
+
+
+
+
 /*
  * Update the metapage info
  */
