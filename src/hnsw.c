@@ -338,7 +338,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->aminsertcleanup = NULL;
 #endif
 	amroutine->ambulkdelete = hnswbulkdelete_dispatch;   //hnswbulkdelete;	// todo dkx ok
-	amroutine->amvacuumcleanup = hnswvacuumcleanup;							// todo dkx
+	amroutine->amvacuumcleanup = hnswvacuumcleanup_dispatch;				// todo dkx ok
 	amroutine->amcanreturn = NULL;
 	amroutine->amcostestimate = hnswcostestimate;							// todo dkx
 	amroutine->amoptions = hnswoptions;										// todo dkx ok

@@ -526,6 +526,9 @@ IndexBulkDeleteResult *hnswbulkdeletemulti(IndexVacuumInfo *info, IndexBulkDelet
 IndexBulkDeleteResult *hnswbulkdelete_dispatch(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
 
 IndexBulkDeleteResult *hnswvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+IndexBulkDeleteResult *hnswvacuumcleanupmulti(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+IndexBulkDeleteResult *hnswvacuumcleanup_dispatch(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+
 IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
