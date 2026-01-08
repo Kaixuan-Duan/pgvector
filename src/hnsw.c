@@ -227,6 +227,132 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	*indexPages = costs.numIndexPages;
 }
 
+
+/*
+ * Estimate the cost of an index scan (multi-column)
+ */
+static void
+hnswcostestimatemulti(PlannerInfo *root, IndexPath *path, double loop_count,
+                      Cost *indexStartupCost, Cost *indexTotalCost,
+                      Selectivity *indexSelectivity, double *indexCorrelation,
+                      double *indexPages)
+{
+    GenericCosts costs;
+    int         m;
+    double      ratio;
+    double      startupPages;
+    double      spc_seq_page_cost;
+    Relation    index;
+    int         col = 0;   /* 0-based */
+
+    /* Never use index without order */
+    if (path->indexorderbys == NULL)
+    {
+        *indexStartupCost = get_float8_infinity();
+        *indexTotalCost = get_float8_infinity();
+        *indexSelectivity = 0;
+        *indexCorrelation = 0;
+        *indexPages = 0;
+#if PG_VERSION_NUM >= 180000
+        path->path.disabled_nodes = 2;
+#endif
+        return;
+    }
+
+    MemSet(&costs, 0, sizeof(costs));
+    genericcostestimate(root, path, loop_count, &costs);
+
+    /*
+     * Choose which index column is used for ORDER BY.
+     * indexorderbycols is a List of column numbers (1-based index column numbers).
+     */
+    if (path->indexorderbycols != NIL)
+    {
+        int colno = linitial_int(path->indexorderbycols); /* 1-based */
+        if (colno > 0)
+            col = colno - 1; /* to 0-based */
+        else
+            col = 0;
+    }
+
+    index = index_open(path->indexinfo->indexoid, NoLock);
+
+    /* 防御：避免 col 越界（例如规划器异常或未来扩展） */
+    {
+        int nkeys = IndexRelationGetNumberOfKeyAttributes(index);
+        if (col < 0 || col >= nkeys)
+            col = 0;
+    }
+
+    /* Read per-column m from metapage */
+    HnswGetMetaPageInfoMulti(index, col, &m, NULL);
+
+    index_close(index, NoLock);
+
+    /* ---- 原版 HNSW 成本模型：完全复用 ---- */
+    if (path->indexinfo->tuples > 0)
+    {
+        double  scalingFactor = 0.55;
+        int     entryLevel = (int) (log(path->indexinfo->tuples) * HnswGetMl(m));
+        int     layer0TuplesMax = HnswGetLayerM(m, 0) * hnsw_ef_search;
+        double  layer0Selectivity =
+            scalingFactor * log(path->indexinfo->tuples) /
+            (log(m) * (1 + log(hnsw_ef_search)));
+
+        ratio = (entryLevel * m + layer0TuplesMax * layer0Selectivity) / path->indexinfo->tuples;
+
+        if (ratio > 1)
+            ratio = 1;
+    }
+    else
+        ratio = 1;
+
+    get_tablespace_page_costs(path->indexinfo->reltablespace, NULL, &spc_seq_page_cost);
+
+    /* Startup cost is cost before returning the first row */
+    costs.indexStartupCost = costs.indexTotalCost * ratio;
+
+    /* Adjust cost if needed since TOAST not included in seq scan cost */
+    startupPages = costs.numIndexPages * ratio;
+    if (startupPages > path->indexinfo->rel->pages && ratio < 0.5)
+    {
+        /* Change all page cost from random to sequential */
+        costs.indexStartupCost -= startupPages * (costs.spc_random_page_cost - spc_seq_page_cost);
+
+        /* Remove cost of extra pages */
+        costs.indexStartupCost -= (startupPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
+    }
+
+    *indexStartupCost = costs.indexStartupCost;
+    *indexTotalCost = costs.indexTotalCost;
+    *indexSelectivity = costs.indexSelectivity;
+    *indexCorrelation = costs.indexCorrelation;
+    *indexPages = costs.numIndexPages;
+}
+
+static void
+hnswcostestimate_dispatch(PlannerInfo *root, IndexPath *path, double loop_count,
+						  Cost *indexStartupCost, Cost *indexTotalCost,
+						  Selectivity *indexSelectivity, double *indexCorrelation,
+						  double *indexPages)
+{
+	Relation index;
+	int nkeys;
+
+	index = index_open(path->indexinfo->indexoid, NoLock);
+	nkeys = IndexRelationGetNumberOfKeyAttributes(index);
+	index_close(index, NoLock);
+
+	if (nkeys <= 1)
+		hnswcostestimate(root, path, loop_count,
+						 indexStartupCost, indexTotalCost,
+						 indexSelectivity, indexCorrelation, indexPages);
+	else
+		hnswcostestimatemulti(root, path, loop_count,
+							  indexStartupCost, indexTotalCost,
+							  indexSelectivity, indexCorrelation, indexPages);
+}
+
 /*
  * Parse and validate the reloptions
  */
@@ -340,7 +466,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->ambulkdelete = hnswbulkdelete_dispatch;   //hnswbulkdelete;	// todo dkx ok
 	amroutine->amvacuumcleanup = hnswvacuumcleanup_dispatch;				// todo dkx ok
 	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = hnswcostestimate;							// todo dkx
+	amroutine->amcostestimate = hnswcostestimate_dispatch;					// todo dkx ok
 	amroutine->amoptions = hnswoptions;										// todo dkx ok
 	amroutine->amproperty = NULL;	/* TODO AMPROP_DISTANCE_ORDERABLE */
 	amroutine->ambuildphasename = hnswbuildphasename;
