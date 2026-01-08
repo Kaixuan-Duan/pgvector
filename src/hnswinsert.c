@@ -920,7 +920,7 @@ static void
 HnswInsertTupleColumn(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, int col)
 {
 	Datum value;
-	const HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
+	const HnswTypeInfo *typeInfo = HnswGetTypeInfoColumn(index, col);
 	HnswSupport support;
 
 	/* Skip null for this column */
