@@ -476,7 +476,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #endif
 	amroutine->ambeginscan = hnswbeginscan_dispatch;						// todo dkx ok
 	amroutine->amrescan = hnswrescan_dispatch;								// todo dkx ok
-	amroutine->amgettuple = hnswgettuple;									// todo dkx
+	amroutine->amgettuple = hnswgettuple_dispatch;							// todo dkx ok
 	amroutine->amgetbitmap = NULL;
 	amroutine->amendscan = hnswendscan;										// todo dkx
 	amroutine->ammarkpos = NULL;

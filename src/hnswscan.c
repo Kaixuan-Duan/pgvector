@@ -446,6 +446,71 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	return false;
 }
 
+
+bool
+hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir)
+{
+	HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+	int col = soMulti->col;
+	void *savedOpaque = scan->opaque;
+
+	/*
+	 * savedOpaque 是“把 scan->opaque 原来的指针先存起来”，
+	 * 因为在 hnswgettuplemulti 里我们要临时把 scan->opaque 改成“当前列的单列 opaque”，
+	 * 调用完原版 hnswgettuple 后必须再改回去。
+	 *
+	 * ex:
+	 *		void *savedOpaque = scan->opaque;
+	 *		scan->opaque = savedOpaque;
+	 */
+
+	bool result = false;
+
+	/* 防御：col 越界就回退到 0 */
+	if (col < 0 || col >= soMulti->nkeys)
+		col = 0;
+
+	/*
+	 * 关键技巧：
+	 * - 原版 hnswgettuple 内部会把 scan->opaque 强转为 HnswScanOpaque
+	 * - 多列下 scan->opaque 实际是 HnswScanOpaqueMulti，会导致崩溃/读错
+	 * - 所以这里临时把 scan->opaque 指向当前列的 HnswScanOpaqueData
+	 *   然后直接复用原版 hnswgettuple 的完整逻辑
+	 *
+	 * 这样 GetScanValue/GetScanItems/ResumeScanItems 等函数完全无需改动，
+	 * 且每列不同 type/opclass 都由 cols[col].typeInfo/support 保证正确。
+	 */
+
+	PG_TRY();
+	{
+		scan->opaque = (void *) &soMulti->cols[col];
+		result = hnswgettuple(scan, dir);
+		scan->opaque = savedOpaque;
+	}
+	PG_CATCH();
+	{
+		/* 确保异常路径也恢复 opaque，避免上层捕获 ERROR 时状态污染 */
+		scan->opaque = savedOpaque;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+
+
+bool
+hnswgettuple_dispatch(IndexScanDesc scan, ScanDirection dir)
+{
+	int nkeys_index = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
+
+	if (nkeys_index <= 1)
+		return hnswgettuple(scan, dir);
+	else
+		return hnswgettuplemulti(scan, dir);
+}
+
 /*
  * End a scan and release resources
  */
