@@ -248,6 +248,61 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 		memmove(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
 }
 
+void
+hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys,
+				ScanKey orderbys, int norderbys)
+{
+	HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+
+	/* 先根据 orderbys 决定本次 scan 用哪一列（0-based） */
+	int col = 0;
+	if (orderbys != NULL && norderbys > 0)
+	{
+		int attno = orderbys[0].sk_attno;  /* 1-based index column number */
+		if (attno > 0)
+			col = attno - 1;
+	}
+	if (col < 0 || col >= soMulti->nkeys)
+		col = 0;
+
+	soMulti->col = col;
+
+	/* 重置每一列的运行态状态（最安全，避免上一次 scan 的状态残留） */
+	for (int i = 0; i < soMulti->nkeys; i++)
+	{
+		HnswScanOpaque so = &soMulti->cols[i];
+
+		so->first = true;
+		/* v and discarded are allocated in tmpCtx */
+		so->v.tids = NULL;
+		so->discarded = NULL;
+		so->tuples = 0;
+		so->previousDistance = -get_float8_infinity();
+		MemoryContextReset(so->tmpCtx);
+	}
+
+	/* 拷贝 keys / orderbys（保持与原版一致） */
+	if (keys && scan->numberOfKeys > 0)
+		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
+
+	if (orderbys && scan->numberOfOrderBys > 0)
+		memmove(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
+}
+
+
+void
+hnswrescan_dispatch(IndexScanDesc scan, ScanKey keys, int nkeys,
+					ScanKey orderbys, int norderbys)
+{
+	int nkeys_index = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
+
+	if (nkeys_index <= 1)
+		hnswrescan(scan, keys, nkeys, orderbys, norderbys);
+	else
+		hnswrescanmulti(scan, keys, nkeys, orderbys, norderbys);
+}
+
+
 /*
  * Fetch the next tuple in the given scan
  */

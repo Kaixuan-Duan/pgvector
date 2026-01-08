@@ -475,7 +475,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->amadjustmembers = NULL;
 #endif
 	amroutine->ambeginscan = hnswbeginscan_dispatch;						// todo dkx ok
-	amroutine->amrescan = hnswrescan;										// todo dkx
+	amroutine->amrescan = hnswrescan_dispatch;								// todo dkx ok
 	amroutine->amgettuple = hnswgettuple;									// todo dkx
 	amroutine->amgetbitmap = NULL;
 	amroutine->amendscan = hnswendscan;										// todo dkx

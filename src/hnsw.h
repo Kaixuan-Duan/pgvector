@@ -550,6 +550,9 @@ IndexScanDesc hnswbeginscanmulti(Relation index, int nkeys, int norderbys);
 IndexScanDesc hnswbeginscan_dispatch(Relation index, int nkeys, int norderbys);
 
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+void		hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+void		hnswrescan_dispatch(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
 void		hnswendscan(IndexScanDesc scan);
 
