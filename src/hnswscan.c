@@ -150,6 +150,82 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 }
 
 /*
+ * Prepare for an index scan (multi-column)
+ */
+/*
+ * Prepare for an index scan (multi-column)
+ * - 每列一份 HnswScanOpaqueData，完全独立（允许冗余但绝不串列）
+ */
+IndexScanDesc
+hnswbeginscanmulti(Relation index, int nkeys, int norderbys)
+{
+	IndexScanDesc scan;
+	HnswScanOpaqueMulti soMulti;
+	double maxMemory;
+	int nkeys_index;
+
+	scan = RelationGetIndexScan(index, nkeys, norderbys);
+
+	/* key 列数（不含 INCLUDE） */
+	nkeys_index = IndexRelationGetNumberOfKeyAttributes(index);
+
+	soMulti = (HnswScanOpaqueMulti) palloc0(sizeof(HnswScanOpaqueDataMulti));
+	soMulti->nkeys = nkeys_index;
+
+	/*
+	 * beginscan 阶段还无法确定 ORDER BY 使用哪一列：
+	 * 先默认 0，后续你在 rescan 链路里再设置 soMulti->col
+	 */
+	soMulti->col = 0;
+
+	/* 分配每列一份原版 opaque */
+	soMulti->cols = (HnswScanOpaqueData *) palloc0(sizeof(HnswScanOpaqueData) * nkeys_index);
+
+	for (int col = 0; col < nkeys_index; col++)
+	{
+		HnswScanOpaque so = &soMulti->cols[col];
+
+		/* typeInfo 必须按列取，支持不同向量类型 */
+		so->typeInfo = HnswGetTypeInfoColumn(index, col);
+
+		/* support 必须按列初始化，支持不同 opclass/procs */
+		HnswInitSupportColumn(&so->support, index, col);
+
+		/*
+		 * tmpCtx / maxMemory：按列各自一份（不共享，冗余但正确）
+		 */
+		so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
+										   "Hnsw scan temporary context",
+										   0, 8 * 1024, 256 * 1024);
+
+		maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
+		so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
+
+		/* 其他字段保持 0/NULL（palloc0 已清零），后续 rescan/gettuple 再使用 */
+	}
+
+	/* opaque 放 multi 指针 */
+	scan->opaque = soMulti;
+
+	return scan;
+}
+
+
+
+IndexScanDesc
+hnswbeginscan_dispatch(Relation index, int nkeys, int norderbys)
+{
+	int nkeys_index = IndexRelationGetNumberOfKeyAttributes(index);
+
+	if (nkeys_index <= 1)
+		return hnswbeginscan(index, nkeys, norderbys);
+	else
+		return hnswbeginscanmulti(index, nkeys, norderbys);
+}
+
+
+
+/*
  * Start or restart an index scan
  */
 void

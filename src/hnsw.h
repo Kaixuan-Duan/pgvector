@@ -418,6 +418,22 @@ typedef struct HnswScanOpaqueData
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
 
+
+typedef struct HnswScanOpaqueDataMulti
+{
+	/* 多列 */
+	int                 nkeys;      /* key 列数（不含 INCLUDE） */
+	int                 col;        /* 当前选中的列（0-based），后续在 rescan 阶段设置 */
+
+	/* 每列一份“原版 scan opaque”（完全独立，允许冗余但不会错） */
+	HnswScanOpaqueData *cols;       /* [nkeys] */
+
+} HnswScanOpaqueDataMulti;
+
+typedef HnswScanOpaqueDataMulti *HnswScanOpaqueMulti;
+
+
+
 typedef struct HnswVacuumState
 {
 	/* Info */
@@ -530,6 +546,9 @@ IndexBulkDeleteResult *hnswvacuumcleanupmulti(IndexVacuumInfo *info, IndexBulkDe
 IndexBulkDeleteResult *hnswvacuumcleanup_dispatch(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
 
 IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
+IndexScanDesc hnswbeginscanmulti(Relation index, int nkeys, int norderbys);
+IndexScanDesc hnswbeginscan_dispatch(Relation index, int nkeys, int norderbys);
+
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
 void		hnswendscan(IndexScanDesc scan);

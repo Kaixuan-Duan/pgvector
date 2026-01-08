@@ -474,7 +474,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 140000
 	amroutine->amadjustmembers = NULL;
 #endif
-	amroutine->ambeginscan = hnswbeginscan;									// todo dkx
+	amroutine->ambeginscan = hnswbeginscan_dispatch;						// todo dkx ok
 	amroutine->amrescan = hnswrescan;										// todo dkx
 	amroutine->amgettuple = hnswgettuple;									// todo dkx
 	amroutine->amgetbitmap = NULL;
