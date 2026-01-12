@@ -554,6 +554,7 @@ void		hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey order
 void		hnswrescan_dispatch(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
+bool		hnswgettuplenew(IndexScanDesc scan, ScanDirection dir);
 bool		hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir);
 bool		hnswgettuple_dispatch(IndexScanDesc scan, ScanDirection dir);
 

@@ -44,6 +44,62 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
 }
 
+static List *
+GetScanItemsColumn(IndexScanDesc scan, Datum value, int col)
+{
+	HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+	Relation index = scan->indexRelation;
+
+	if (col < 0 || col >= soMulti->nkeys)
+		elog(ERROR, "hnsw scan col out of range: col=%d nkeys=%d", col, soMulti->nkeys);
+
+	HnswScanOpaque so = &soMulti->cols[col];          /* 当前列自己的 opaque */
+	HnswSupport *support = &so->support;
+
+	List *ep;
+	List *w;
+	int m;
+	HnswElement entryPoint;
+	char *base = NULL;
+	HnswQuery *q = &so->q;
+
+	/*
+	 * ✅ 关键差异：按列读取 m / entryPoint
+	 * - 旧布局时 HnswGetMetaPageInfoMulti(col=0) 会兼容
+	 * - 新布局时会取 graphs[col]
+	 */
+	HnswGetMetaPageInfoMulti(index, col, &m, &entryPoint);
+
+	q->value = value;
+	so->m = m;
+
+	if (entryPoint == NULL)
+		return NIL;
+
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
+
+	for (int lc = entryPoint->level; lc >= 1; lc--)
+	{
+		w = HnswSearchLayer(base, q, ep, 1, lc,
+							index, support, m,
+							false,
+							NULL, NULL, NULL,
+							true,
+							NULL);
+		ep = w;
+	}
+
+	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0,
+						   index, support, m,
+						   false,
+						   NULL,
+						   &so->v,
+						   (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF) ? &so->discarded : NULL,
+						   true,
+						   &so->tuples);
+}
+
+
 /*
  * Resume scan at ground level with discarded candidates
  */
@@ -74,6 +130,48 @@ ResumeScanItems(IndexScanDesc scan)
 
 	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
 }
+
+
+static List *
+ResumeScanItemsColumn(IndexScanDesc scan, int col)
+{
+	HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+	Relation index = scan->indexRelation;
+
+	if (col < 0 || col >= soMulti->nkeys)
+		elog(ERROR, "hnsw scan col out of range: col=%d nkeys=%d", col, soMulti->nkeys);
+
+	HnswScanOpaque so = &soMulti->cols[col];          /* 当前列自己的 opaque */
+
+	List *ep = NIL;
+	char *base = NULL;
+	int batch_size = hnsw_ef_search;
+
+	if (so->discarded == NULL || pairingheap_is_empty(so->discarded))
+		return NIL;
+
+	/* Get next batch of candidates */
+	for (int i = 0; i < batch_size; i++)
+	{
+		HnswSearchCandidate *sc;
+
+		if (pairingheap_is_empty(so->discarded))
+			break;
+
+		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
+		ep = lappend(ep, sc);
+	}
+
+	return HnswSearchLayer(base, &so->q, ep, batch_size, 0,
+						   index, &so->support, so->m,
+						   false,
+						   NULL,
+						   &so->v,
+						   &so->discarded,
+						   false,
+						   &so->tuples);
+}
+
 
 /*
  * Get scan value
@@ -446,6 +544,182 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	return false;
 }
 
+int
+HnswGetOrderByCol(IndexScanDesc scan)
+{
+	int nkeys;
+	int attno;
+
+	/* hnsw 必须有 order by（原版也会这样检查） */
+	if (scan->orderByData == NULL || scan->numberOfOrderBys <= 0)
+		elog(ERROR, "cannot scan hnsw index without order");
+
+	/*
+	 * sk_attno: 1-based index attribute number (key attrs)
+	 * 对应 planner 选择的“哪个 index key 列”来做 orderby
+	 */
+	attno = scan->orderByData[0].sk_attno;
+
+	/* key 列数量（不含 INCLUDE） */
+	nkeys = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
+
+	if (attno <= 0 || attno > nkeys)
+		elog(ERROR, "invalid hnsw orderby attno=%d (nkeys=%d)", attno, nkeys);
+
+	/* 防御：如果有多个 orderby，要求它们都指向同一列 */
+	for (int i = 1; i < scan->numberOfOrderBys; i++)
+	{
+		if (scan->orderByData[i].sk_attno != attno)
+			elog(ERROR,
+				 "multi-orderby not supported for hnsw multi-column scan: "
+				 "orderby attno mismatch (%d vs %d)",
+				 attno, scan->orderByData[i].sk_attno);
+	}
+
+	return attno - 1; /* 0-based col */
+}
+
+/*
+ * Fetch the next tuple for multi-layout scan
+ * - keep original hnswgettuple() unchanged
+ * - only replace GetScanItems / ResumeScanItems with column-aware versions
+ */
+bool
+hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
+	/*
+	 * Index can be used to scan backward, but Postgres doesn't support
+	 * backward scan on operators
+	 */
+	Assert(ScanDirectionIsForward(dir));
+
+	if (so->first)
+	{
+		Datum		value;
+        int   col;
+
+		/* Count index scan for stats */
+		pgstat_count_index_scan(scan->indexRelation);
+
+		/* Safety check */
+		if (scan->orderByData == NULL)
+			elog(ERROR, "cannot scan hnsw index without order");
+
+		/* Requires MVCC-compliant snapshot as not able to maintain a pin */
+		/* https://www.postgresql.org/docs/current/index-locking.html */
+		if (!IsMVCCSnapshot(scan->xs_snapshot))
+			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
+
+		/* Get scan value */
+		value = GetScanValue(scan);
+
+        /* 关键：从 orderByData 决定当前列 */
+        col = HnswGetOrderByCol(scan);
+
+		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+        /* 关键改动 1：按列取 scan items */
+        so->w = GetScanItemsColumn(scan, value, col);
+
+		/* Release shared lock */
+		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+		so->first = false;
+
+#if defined(HNSW_MEMORY)
+		ShowMemoryUsage(so);
+#endif
+	}
+
+	for (;;)
+	{
+		char	   *base = NULL;
+		HnswSearchCandidate *sc;
+		HnswElement element;
+		ItemPointer heaptid;
+
+		if (list_length(so->w) == 0)
+		{
+			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
+				break;
+
+			/* Empty index */
+			if (so->discarded == NULL)
+				break;
+
+			/* Reached max number of tuples or memory limit */
+			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
+			{
+				if (pairingheap_is_empty(so->discarded))
+					break;
+
+				/* Return remaining tuples */
+				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
+			}
+            else
+            {
+                int col = HnswGetOrderByCol(scan);
+
+                LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+                /* 关键改动 2：按列 resume */
+                so->w = ResumeScanItemsColumn(scan, col);
+
+				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+#if defined(HNSW_MEMORY)
+				ShowMemoryUsage(so);
+#endif
+			}
+
+			if (list_length(so->w) == 0)
+				break;
+		}
+
+		sc = llast(so->w);
+		element = HnswPtrAccess(base, sc->element);
+
+		/* Move to next element if no valid heap TIDs */
+		if (element->heaptidsLength == 0)
+		{
+			so->w = list_delete_last(so->w);
+
+			/* Mark memory as free for next iteration */
+			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			{
+				pfree(element);
+				pfree(sc);
+			}
+
+			continue;
+		}
+
+		heaptid = &element->heaptids[--element->heaptidsLength];
+
+		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
+		{
+			if (sc->distance < so->previousDistance)
+				continue;
+
+			so->previousDistance = sc->distance;
+		}
+
+		MemoryContextSwitchTo(oldCtx);
+
+		scan->xs_heaptid = *heaptid;
+		scan->xs_recheck = false;
+		scan->xs_recheckorderby = false;
+		return true;
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+	return false;
+}
+
+
 
 bool
 hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir)
@@ -484,7 +758,7 @@ hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir)
 	PG_TRY();
 	{
 		scan->opaque = (void *) &soMulti->cols[col];
-		result = hnswgettuple(scan, dir);
+		result = hnswgettuplenew(scan, dir);
 		scan->opaque = savedOpaque;
 	}
 	PG_CATCH();

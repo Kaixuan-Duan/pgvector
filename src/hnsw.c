@@ -14,6 +14,9 @@
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 
+#include "utils/rel.h"
+
+
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
 #endif
