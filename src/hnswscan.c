@@ -589,6 +589,8 @@ hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
 {
     HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
     int col;
+    HnswScanOpaque so;
+    MemoryContext oldCtx;
 
     /* Index can be used to scan backward, but Postgres doesn't support backward scan on operators */
     Assert(ScanDirectionIsForward(dir));
@@ -607,21 +609,35 @@ hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
     if (col < 0 || col >= soMulti->nkeys)
         elog(ERROR, "hnsw scan col out of range: col=%d nkeys=%d", col, soMulti->nkeys);
 
-    /* 当前列的单列 opaque（每列一份状态） */
-    HnswScanOpaque so = &soMulti->cols[col];
+    /* 当前列的单列 opaque */
+    so = &soMulti->cols[col];
 
-    /* 从这一列的 tmpCtx 开始工作 */
-    MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+    oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
     if (so->first)
     {
         Datum value;
+        void *savedOpaque = scan->opaque;
 
         /* Count index scan for stats */
         pgstat_count_index_scan(scan->indexRelation);
 
-        /* Get scan value */
-        value = GetScanValue(scan);
+        /*
+         * ✅ 关键修复：GetScanValue 仍然是“单列假设”，
+         * 所以这里临时把 scan->opaque 切到当前列 so。
+         */
+        PG_TRY();
+        {
+            scan->opaque = (void *) so;          /* 单列 opaque */
+            value = GetScanValue(scan);         /* 原版逻辑不改 */
+            scan->opaque = savedOpaque;         /* 切回 Multi */
+        }
+        PG_CATCH();
+        {
+            scan->opaque = savedOpaque;
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
 
         /*
          * Get a shared lock. This allows vacuum to ensure no in-flight scans
