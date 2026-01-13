@@ -315,12 +315,15 @@ hnswbeginscan_dispatch(Relation index, int nkeys, int norderbys)
 {
 	int nkeys_index = IndexRelationGetNumberOfKeyAttributes(index);
 
-	if (nkeys_index <= 1)
+	if (nkeys_index <= 1) {
 		elog(LOG, "hnswbeginscan");
 		return hnswbeginscan(index, nkeys, norderbys);
-	else
+	}
+	else {
 		elog(LOG, "hnswbeginscanmulti");
 		return hnswbeginscanmulti(index, nkeys, norderbys);
+	}
+
 }
 
 
