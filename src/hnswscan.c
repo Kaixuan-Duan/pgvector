@@ -316,8 +316,10 @@ hnswbeginscan_dispatch(Relation index, int nkeys, int norderbys)
 	int nkeys_index = IndexRelationGetNumberOfKeyAttributes(index);
 
 	if (nkeys_index <= 1)
+		elog(LOG, "hnswbeginscan");
 		return hnswbeginscan(index, nkeys, norderbys);
 	else
+		elog(LOG, "hnswbeginscanmulti");
 		return hnswbeginscanmulti(index, nkeys, norderbys);
 }
 
@@ -544,7 +546,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	return false;
 }
 
-int
+static int
 HnswGetOrderByCol(IndexScanDesc scan)
 {
 	int nkeys;
@@ -579,144 +581,146 @@ HnswGetOrderByCol(IndexScanDesc scan)
 	return attno - 1; /* 0-based col */
 }
 
-/*
- * Fetch the next tuple for multi-layout scan
- * - keep original hnswgettuple() unchanged
- * - only replace GetScanItems / ResumeScanItems with column-aware versions
- */
 bool
 hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
 {
-	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
-	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+    HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+    int col;
 
-	/*
-	 * Index can be used to scan backward, but Postgres doesn't support
-	 * backward scan on operators
-	 */
-	Assert(ScanDirectionIsForward(dir));
+    /* Index can be used to scan backward, but Postgres doesn't support backward scan on operators */
+    Assert(ScanDirectionIsForward(dir));
 
-	if (so->first)
-	{
-		Datum		value;
-        int   col;
+    /* Safety check */
+    if (scan->orderByData == NULL)
+        elog(ERROR, "cannot scan hnsw index without order");
 
-		/* Count index scan for stats */
-		pgstat_count_index_scan(scan->indexRelation);
+    /* Requires MVCC-compliant snapshot as not able to maintain a pin */
+    if (!IsMVCCSnapshot(scan->xs_snapshot))
+        elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
 
-		/* Safety check */
-		if (scan->orderByData == NULL)
-			elog(ERROR, "cannot scan hnsw index without order");
+    /* 关键：从 orderByData 决定当前列（0-based） */
+    col = HnswGetOrderByCol(scan);
 
-		/* Requires MVCC-compliant snapshot as not able to maintain a pin */
-		/* https://www.postgresql.org/docs/current/index-locking.html */
-		if (!IsMVCCSnapshot(scan->xs_snapshot))
-			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
+    if (col < 0 || col >= soMulti->nkeys)
+        elog(ERROR, "hnsw scan col out of range: col=%d nkeys=%d", col, soMulti->nkeys);
 
-		/* Get scan value */
-		value = GetScanValue(scan);
+    /* 当前列的单列 opaque（每列一份状态） */
+    HnswScanOpaque so = &soMulti->cols[col];
 
-        /* 关键：从 orderByData 决定当前列 */
-        col = HnswGetOrderByCol(scan);
+    /* 从这一列的 tmpCtx 开始工作 */
+    MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
-		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+    if (so->first)
+    {
+        Datum value;
 
-        /* 关键改动 1：按列取 scan items */
+        /* Count index scan for stats */
+        pgstat_count_index_scan(scan->indexRelation);
+
+        /* Get scan value */
+        value = GetScanValue(scan);
+
+        /*
+         * Get a shared lock. This allows vacuum to ensure no in-flight scans
+         * before marking tuples as deleted.
+         */
+        LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+        /* 关键改动 1：按列取 scan items（scan->opaque 仍是 Multi） */
         so->w = GetScanItemsColumn(scan, value, col);
 
-		/* Release shared lock */
-		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+        UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-		so->first = false;
+        so->first = false;
 
 #if defined(HNSW_MEMORY)
-		ShowMemoryUsage(so);
+        ShowMemoryUsage(so);
 #endif
-	}
+    }
 
-	for (;;)
-	{
-		char	   *base = NULL;
-		HnswSearchCandidate *sc;
-		HnswElement element;
-		ItemPointer heaptid;
+    for (;;)
+    {
+        char *base = NULL;
+        HnswSearchCandidate *sc;
+        HnswElement element;
+        ItemPointer heaptid;
 
-		if (list_length(so->w) == 0)
-		{
-			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
-				break;
+        if (list_length(so->w) == 0)
+        {
+            if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
+                break;
 
-			/* Empty index */
-			if (so->discarded == NULL)
-				break;
+            /* Empty index */
+            if (so->discarded == NULL)
+                break;
 
-			/* Reached max number of tuples or memory limit */
-			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
-			{
-				if (pairingheap_is_empty(so->discarded))
-					break;
+            /* Reached max number of tuples or memory limit */
+            if (so->tuples >= hnsw_max_scan_tuples ||
+                MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
+            {
+                if (pairingheap_is_empty(so->discarded))
+                    break;
 
-				/* Return remaining tuples */
-				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
-			}
+                /* Return remaining tuples */
+                so->w = lappend(so->w,
+                                HnswGetSearchCandidate(w_node,
+                                                      pairingheap_remove_first(so->discarded)));
+            }
             else
             {
-                int col = HnswGetOrderByCol(scan);
-
                 LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-                /* 关键改动 2：按列 resume */
+                /* 关键改动 2：按列 resume（scan->opaque 仍是 Multi） */
                 so->w = ResumeScanItemsColumn(scan, col);
 
-				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+                UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
 #if defined(HNSW_MEMORY)
-				ShowMemoryUsage(so);
+                ShowMemoryUsage(so);
 #endif
-			}
+            }
 
-			if (list_length(so->w) == 0)
-				break;
-		}
+            if (list_length(so->w) == 0)
+                break;
+        }
 
-		sc = llast(so->w);
-		element = HnswPtrAccess(base, sc->element);
+        sc = llast(so->w);
+        element = HnswPtrAccess(base, sc->element);
 
-		/* Move to next element if no valid heap TIDs */
-		if (element->heaptidsLength == 0)
-		{
-			so->w = list_delete_last(so->w);
+        /* Move to next element if no valid heap TIDs */
+        if (element->heaptidsLength == 0)
+        {
+            so->w = list_delete_last(so->w);
 
-			/* Mark memory as free for next iteration */
-			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
-			{
-				pfree(element);
-				pfree(sc);
-			}
+            if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+            {
+                pfree(element);
+                pfree(sc);
+            }
 
-			continue;
-		}
+            continue;
+        }
 
-		heaptid = &element->heaptids[--element->heaptidsLength];
+        heaptid = &element->heaptids[--element->heaptidsLength];
 
-		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
-		{
-			if (sc->distance < so->previousDistance)
-				continue;
+        if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
+        {
+            if (sc->distance < so->previousDistance)
+                continue;
 
-			so->previousDistance = sc->distance;
-		}
+            so->previousDistance = sc->distance;
+        }
 
-		MemoryContextSwitchTo(oldCtx);
+        MemoryContextSwitchTo(oldCtx);
 
-		scan->xs_heaptid = *heaptid;
-		scan->xs_recheck = false;
-		scan->xs_recheckorderby = false;
-		return true;
-	}
+        scan->xs_heaptid = *heaptid;
+        scan->xs_recheck = false;
+        scan->xs_recheckorderby = false;
+        return true;
+    }
 
-	MemoryContextSwitchTo(oldCtx);
-	return false;
+    MemoryContextSwitchTo(oldCtx);
+    return false;
 }
 
 
@@ -724,52 +728,7 @@ hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
 bool
 hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir)
 {
-	HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
-	int col = soMulti->col;
-	void *savedOpaque = scan->opaque;
-
-	/*
-	 * savedOpaque 是“把 scan->opaque 原来的指针先存起来”，
-	 * 因为在 hnswgettuplemulti 里我们要临时把 scan->opaque 改成“当前列的单列 opaque”，
-	 * 调用完原版 hnswgettuple 后必须再改回去。
-	 *
-	 * ex:
-	 *		void *savedOpaque = scan->opaque;
-	 *		scan->opaque = savedOpaque;
-	 */
-
-	bool result = false;
-
-	/* 防御：col 越界就回退到 0 */
-	if (col < 0 || col >= soMulti->nkeys)
-		col = 0;
-
-	/*
-	 * 关键技巧：
-	 * - 原版 hnswgettuple 内部会把 scan->opaque 强转为 HnswScanOpaque
-	 * - 多列下 scan->opaque 实际是 HnswScanOpaqueMulti，会导致崩溃/读错
-	 * - 所以这里临时把 scan->opaque 指向当前列的 HnswScanOpaqueData
-	 *   然后直接复用原版 hnswgettuple 的完整逻辑
-	 *
-	 * 这样 GetScanValue/GetScanItems/ResumeScanItems 等函数完全无需改动，
-	 * 且每列不同 type/opclass 都由 cols[col].typeInfo/support 保证正确。
-	 */
-
-	PG_TRY();
-	{
-		scan->opaque = (void *) &soMulti->cols[col];
-		result = hnswgettuplenew(scan, dir);
-		scan->opaque = savedOpaque;
-	}
-	PG_CATCH();
-	{
-		/* 确保异常路径也恢复 opaque，避免上层捕获 ERROR 时状态污染 */
-		scan->opaque = savedOpaque;
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	return result;
+	return hnswgettuplenew(scan, dir);
 }
 
 
