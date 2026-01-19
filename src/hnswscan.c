@@ -646,8 +646,8 @@ HnswTieCmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 
 	for (int i = 0; i < soMulti->norderbys; i++)
 	{
-		if (ca->dists[i] < cb->dists[i]) return -1;
-		if (ca->dists[i] > cb->dists[i]) return  1;
+		if (ca->dists[i] < cb->dists[i]) return 1;
+		if (ca->dists[i] > cb->dists[i]) return -1;
 	}
 
 	return ItemPointerCompare((ItemPointer) &ca->tid, (ItemPointer) &cb->tid);
