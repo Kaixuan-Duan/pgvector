@@ -424,13 +424,28 @@ typedef struct HnswScanOpaqueDataMulti
 	/* 多列 */
 	int                 nkeys;      /* key 列数（不含 INCLUDE） */
 	int                 col;        /* 当前选中的列（0-based），后续在 rescan 阶段设置 */
-
-	/* 每列一份“原版 scan opaque”（完全独立，允许冗余但不会错） */
 	HnswScanOpaqueData *cols;       /* [nkeys] */
+
+	/* 新增：多 ORDER BY 词典序支持 */
+	bool                orderby_inited;
+	int                 norderbys;
+	int                *orderby_cols;   /* [norderbys] 每个 ORDER BY key 对应的 index key col(0-based) */
+	int                 drive_col;      /* driving 列：orderby_cols[0] */
+
+	pairingheap         *tieheap;       /* 当前 d1 组的候选堆（按 d2.. 排） */
+	double               current_d1;    /* 当前 tieheap 所属的 d1 值 */
 
 } HnswScanOpaqueDataMulti;
 
 typedef HnswScanOpaqueDataMulti *HnswScanOpaqueMulti;
+
+typedef struct HnswTieCandidate
+{
+	pairingheap_node     ph_node;
+	ItemPointerData      tid;
+	float8              *dists;   /* dists[0]=d1, dists[1]=d2,... */
+} HnswTieCandidate;
+
 
 
 
