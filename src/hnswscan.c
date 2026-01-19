@@ -650,7 +650,7 @@ HnswTieCmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 		if (ca->dists[i] > cb->dists[i]) return  1;
 	}
 
-	return ItemPointerCompare(&ca->tid, &cb->tid);
+	return ItemPointerCompare((ItemPointer) &ca->tid, (ItemPointer) &cb->tid);
 }
 
 static inline float8
@@ -671,7 +671,7 @@ HnswDistanceDatumToFloat8(Datum d, Oid func_oid)
 
 
 
-bool
+static bool
 ComputeOtherDistancesFromHeap(IndexScanDesc scan,
                               HnswScanOpaqueMulti soMulti,
                               ItemPointer tid_in,
@@ -964,7 +964,7 @@ hnswgettuplemulti_lex(IndexScanDesc scan, ScanDirection dir)
 }
 
 
-bool
+static bool
 hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
 {
     HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
