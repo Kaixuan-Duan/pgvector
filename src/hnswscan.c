@@ -64,7 +64,7 @@ GetScanItemsColumn(IndexScanDesc scan, Datum value, int col)
 	HnswQuery *q = &so->q;
 
 	/*
-	 * ✅ 关键差异：按列读取 m / entryPoint
+	 * 关键差异：按列读取 m / entryPoint
 	 * - 旧布局时 HnswGetMetaPageInfoMulti(col=0) 会兼容
 	 * - 新布局时会取 graphs[col]
 	 */
@@ -585,7 +585,7 @@ HnswGetOrderByCol(IndexScanDesc scan)
 }
 
 bool
-hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
+hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir)
 {
     HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
     int col;
@@ -623,7 +623,7 @@ hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
         pgstat_count_index_scan(scan->indexRelation);
 
         /*
-         * ✅ 关键修复：GetScanValue 仍然是“单列假设”，
+         * 关键修复：GetScanValue 仍然是“单列假设”，
          * 所以这里临时把 scan->opaque 切到当前列 so。
          */
         PG_TRY();
@@ -743,12 +743,6 @@ hnswgettuplenew(IndexScanDesc scan, ScanDirection dir)
 }
 
 
-
-bool
-hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir)
-{
-	return hnswgettuplenew(scan, dir);
-}
 
 
 
