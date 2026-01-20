@@ -916,3 +916,81 @@ CREATE OPERATOR CLASS sparsevec_l1_ops
 	OPERATOR 1 <+> (sparsevec, sparsevec) FOR ORDER BY float_ops,
 	FUNCTION 1 l1_distance(sparsevec, sparsevec),
 	FUNCTION 3 hnsw_sparsevec_support(internal);
+
+
+-- ------------------------------------------------------------
+-- RRF fusion score function (planner hook / custom scan marker)
+-- NOTE: Implementation is in C symbol: rrf
+-- ------------------------------------------------------------
+
+-- 1) sparsevec + vector
+CREATE FUNCTION rrf(
+    emb1   sparsevec,
+    op1    regoperator,
+    q1     sparsevec,
+    emb2   vector,
+    op2    regoperator,
+    q2     vector,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C STRICT STABLE;
+
+-- 1) vector + sparsevec
+CREATE FUNCTION rrf(
+    emb1   vector,
+    op1    regoperator,
+    q1     vector,
+    emb2   sparsevec,
+    op2    regoperator,
+    q2     sparsevec,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C STRICT STABLE;
+
+-- 2) sparsevec + sparsevec
+CREATE FUNCTION rrf(
+    emb1   sparsevec,
+    op1    regoperator,
+    q1     sparsevec,
+    emb2   sparsevec,
+    op2    regoperator,
+    q2     sparsevec,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C STRICT STABLE;
+
+-- 3) vector + vector
+CREATE FUNCTION rrf(
+    emb1   vector,
+    op1    regoperator,
+    q1     vector,
+    emb2   vector,
+    op2    regoperator,
+    q2     vector,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C STRICT STABLE;

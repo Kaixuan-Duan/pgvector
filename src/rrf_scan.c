@@ -26,6 +26,12 @@
 
 #include "hnswtopk.h"
 
+#include "optimizer/paths.h"
+#include "optimizer/clauses.h"
+#include "nodes/parsenodes.h"
+extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
+
+void VectorRrfInit(void);
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
 /* ---------------- Result structs ---------------- */
@@ -195,19 +201,32 @@ cmp_rrf_item_desc(const void *a, const void *b)
     return 0;
 }
 
+/* 不用 get_sortgroupclause_tle，手工按 tleSortGroupRef 匹配 */
+static TargetEntry *
+find_tle_by_sortgroupref(List *tlist, Index ref)
+{
+    ListCell *lc;
+    foreach (lc, tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (tle->ressortgroupref == ref)
+            return tle;
+    }
+    return NULL;
+}
+
 /* Find rrf() in ORDER BY target entry (MVP: single sort key, DESC only) */
 static FuncExpr *
 find_rrf_sort_expr(PlannerInfo *root, bool *is_desc_out)
 {
     Query *q = root->parse;
-    if (q->sortClause == NIL)
-        return NULL;
 
-    if (list_length(q->sortClause) != 1)
+    if (q->sortClause == NIL || list_length(q->sortClause) != 1)
         return NULL;
 
     SortGroupClause *sgc = (SortGroupClause *) linitial(q->sortClause);
-    TargetEntry *tle = get_sortgroupclause_tle(sgc, q->targetList);
+
+    TargetEntry *tle = find_tle_by_sortgroupref(q->targetList, sgc->tleSortGroupRef);
     if (tle == NULL)
         return NULL;
 
@@ -215,14 +234,13 @@ find_rrf_sort_expr(PlannerInfo *root, bool *is_desc_out)
     if (!IsA(expr, FuncExpr))
         return NULL;
 
-#if defined(__GNUC__)
-    /* PG 14+ 有 reverse_sort 字段；若你版本没有，删掉这段，默认只支持 DESC */
-#endif
-#ifdef HAVE_SGC_REVERSE_SORT_FIELD
-    *is_desc_out = sgc->reverse_sort;
-#else
+    /* PG17 有 reverse_sort：true 表示 DESC */
+    // *is_desc_out = sgc->reverse_sort;
+    // *is_desc_out = false;  // 默认 ASC
+    (void) sgc->sortop;
+    (void) sgc->nulls_first;
     *is_desc_out = true;
-#endif
+
 
     return (FuncExpr *) expr;
 }
@@ -308,7 +326,9 @@ replace_rrf_in_tlist(List *tlist, int score_resno)
 static List *
 build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score_resno_out)
 {
-    RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+    /* rel->relid 是 rtable 的 1-based 索引 */
+    RangeTblEntry *rte = (RangeTblEntry *) list_nth(root->parse->rtable, rel->relid - 1);
+
     if (rte == NULL || rte->rtekind != RTE_RELATION)
         ereport(ERROR, (errmsg("VectorRRF expects a base table RTE")));
 

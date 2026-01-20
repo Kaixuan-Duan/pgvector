@@ -11,7 +11,8 @@
 #include "storage/itemptr.h"
 #include "utils/rel.h"
 
-/* 你的声明头 */
+#include "utils/snapmgr.h"
+#include <math.h>
 #include "hnswtopk.h"
 
 /*
@@ -89,9 +90,9 @@ HnswTopKForColumn(Relation heapRel,
                            query);            /* sk_argument: query vector Datum */
 
     /* 把 orderby operator/collation 也填进 scan 描述符（很多 AM 会看这里） */
-    scan->orderByOperators[0] = orderby_op;
-    scan->orderByCollations[0] = InvalidOid;
-    scan->orderByNullsFirst[0] = false;
+    // scan->orderByOperators[0] = orderby_op;
+    // scan->orderByCollations[0] = InvalidOid;
+    // scan->orderByNullsFirst[0] = false;
 
     /* 触发 AM rescan（你的 HNSW 会在这里或首次 getnext_tid 初始化候选集） */
     index_rescan(scan, NULL, 0, &orderbykey, 1);
@@ -115,7 +116,7 @@ HnswTopKForColumn(Relation heapRel,
          */
         if (scan->xs_orderbynulls && scan->xs_orderbynulls[0])
         {
-            out[n].distance = get_float8_infinity();
+            out[n].distance = HUGE_VAL;
         }
         else
         {
