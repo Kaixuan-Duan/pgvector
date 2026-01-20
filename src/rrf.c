@@ -17,7 +17,8 @@ rrf(PG_FUNCTION_ARGS)
 {
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("rrf() must be used with ORDER BY to enable vector RRF CustomScan"),
-             errhint("Use: SELECT ..., rrf(...) AS s1 FROM ... ORDER BY s1 DESC LIMIT ...")));
-    PG_RETURN_FLOAT8(0); /* keep compiler quiet */
+             errmsg("rrf() must be used with ORDER BY to enable VectorRRF CustomScan"),
+             errhint("Use: SELECT ..., rrf(emb1, '<#>'::regoperator, q1, emb2, '<#>'::regoperator, q2, ...) AS s1 "
+                     "FROM ... ORDER BY s1 DESC LIMIT ...")));
+    PG_RETURN_FLOAT8(0);
 }

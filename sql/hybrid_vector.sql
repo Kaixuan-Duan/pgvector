@@ -926,8 +926,10 @@ CREATE OPERATOR CLASS sparsevec_l1_ops
 -- 1) sparsevec + vector
 CREATE FUNCTION rrf(
     emb1   sparsevec,
+    op1    regoperator,
     q1     sparsevec,
     emb2   vector,
+    op2    regoperator,
     q2     vector,
     k      integer            DEFAULT 60,
     w1     double precision   DEFAULT 0.5,
@@ -937,15 +939,15 @@ CREATE FUNCTION rrf(
 )
     RETURNS double precision
 AS 'MODULE_PATHNAME', 'rrf'
-LANGUAGE C
-STRICT
-STABLE;
+LANGUAGE C STRICT STABLE;
 
--- 2) sparsevec + sparsevec
+-- 1) vector + sparsevec
 CREATE FUNCTION rrf(
-    emb1   sparsevec,
-    q1     sparsevec,
+    emb1   vector,
+    op1    regoperator,
+    q1     vector,
     emb2   sparsevec,
+    op2    regoperator,
     q2     sparsevec,
     k      integer            DEFAULT 60,
     w1     double precision   DEFAULT 0.5,
@@ -955,15 +957,33 @@ CREATE FUNCTION rrf(
 )
     RETURNS double precision
 AS 'MODULE_PATHNAME', 'rrf'
-LANGUAGE C
-STRICT
-STABLE;
+LANGUAGE C STRICT STABLE;
+
+-- 2) sparsevec + sparsevec
+CREATE FUNCTION rrf(
+    emb1   sparsevec,
+    op1    regoperator,
+    q1     sparsevec,
+    emb2   sparsevec,
+    op2    regoperator,
+    q2     sparsevec,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C STRICT STABLE;
 
 -- 3) vector + vector
 CREATE FUNCTION rrf(
     emb1   vector,
+    op1    regoperator,
     q1     vector,
     emb2   vector,
+    op2    regoperator,
     q2     vector,
     k      integer            DEFAULT 60,
     w1     double precision   DEFAULT 0.5,
@@ -973,6 +993,4 @@ CREATE FUNCTION rrf(
 )
     RETURNS double precision
 AS 'MODULE_PATHNAME', 'rrf'
-LANGUAGE C
-STRICT
-STABLE;
+LANGUAGE C STRICT STABLE;
