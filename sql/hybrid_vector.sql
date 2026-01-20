@@ -916,3 +916,63 @@ CREATE OPERATOR CLASS sparsevec_l1_ops
 	OPERATOR 1 <+> (sparsevec, sparsevec) FOR ORDER BY float_ops,
 	FUNCTION 1 l1_distance(sparsevec, sparsevec),
 	FUNCTION 3 hnsw_sparsevec_support(internal);
+
+
+-- ------------------------------------------------------------
+-- RRF fusion score function (planner hook / custom scan marker)
+-- NOTE: Implementation is in C symbol: rrf
+-- ------------------------------------------------------------
+
+-- 1) sparsevec + vector
+CREATE FUNCTION rrf(
+    emb1   sparsevec,
+    q1     sparsevec,
+    emb2   vector,
+    q2     vector,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C
+STRICT
+STABLE;
+
+-- 2) sparsevec + sparsevec
+CREATE FUNCTION rrf(
+    emb1   sparsevec,
+    q1     sparsevec,
+    emb2   sparsevec,
+    q2     sparsevec,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C
+STRICT
+STABLE;
+
+-- 3) vector + vector
+CREATE FUNCTION rrf(
+    emb1   vector,
+    q1     vector,
+    emb2   vector,
+    q2     vector,
+    k      integer            DEFAULT 60,
+    w1     double precision   DEFAULT 0.5,
+    w2     double precision   DEFAULT 0.5,
+    cand1  integer            DEFAULT 200,
+    cand2  integer            DEFAULT 200
+)
+    RETURNS double precision
+AS 'MODULE_PATHNAME', 'rrf'
+LANGUAGE C
+STRICT
+STABLE;
