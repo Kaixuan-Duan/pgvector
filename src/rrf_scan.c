@@ -869,7 +869,8 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
     /* heap fetch slot */
     st->heapSlot = ExecInitExtraTupleSlot(estate,
                                           RelationGetDescr(st->heapRel),
-                                          &TTSOpsHeapTuple);
+                                          &TTSOpsBufferHeapTuple);
+
 
     /* compute results */
     MemoryContextReset(st->rrf_mcxt);
