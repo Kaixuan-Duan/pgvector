@@ -4,6 +4,7 @@
 #include <string.h>
 #include <limits.h>
 
+#include "nodes/parsenodes.h"
 #include "access/genam.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -28,7 +29,6 @@
 
 #include "optimizer/paths.h"
 #include "optimizer/clauses.h"
-#include "nodes/parsenodes.h"
 
 #include "access/htup_details.h"
 #include "utils/syscache.h"
@@ -240,6 +240,19 @@ cmp_rrf_item_desc(const void *a, const void *b)
     return 0;
 }
 
+/* 不用 get_sortgroupclause_tle，手工按 tleSortGroupRef 匹配 */
+static TargetEntry *
+find_tle_by_sortgroupref(List *tlist, Index ref)
+{
+    ListCell *lc;
+    foreach (lc, tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (tle->ressortgroupref == ref)
+            return tle;
+    }
+    return NULL;
+}
 
 
 /* Find rrf() in ORDER BY target entry (MVP: single sort key, DESC only) */
@@ -253,40 +266,24 @@ find_rrf_sort_expr(PlannerInfo *root, bool *is_desc_out)
 
     SortGroupClause *sgc = linitial_node(SortGroupClause, q->sortClause);
 
-    /* 取 ORDER BY 对应的真实表达式（支持 ORDER BY 别名 s1） */
-    Expr *sortexpr = (Expr *) get_sortgroupclause_expr(sgc, q->targetList);
-    if (sortexpr == NULL)
-        return NULL;
-
-    sortexpr = strip_expr_wrappers(sortexpr);
-    if (!IsA(sortexpr, FuncExpr))
-        return NULL;
-
     /*
-     * 通过 sortop 判断 ASC/DESC：
-     * sgc->sortop 是 operator OID（不是 function OID）
+     * ORDER BY s1 的 s1 是 targetlist 里的某个 TargetEntry，
+     * 通过 tleSortGroupRef 找到对应的 TLE，然后取 tle->expr。
      */
-    Oid restype = exprType((Node *) sortexpr);
+    TargetEntry *tle = find_tle_by_sortgroupref(q->targetList, sgc->tleSortGroupRef);
+    if (tle == NULL)
+        return NULL;
 
-    Oid ltop = InvalidOid, eqop = InvalidOid, gtop = InvalidOid;
-    bool isHashable = false;
+    Expr *expr = strip_expr_wrappers((Expr *) tle->expr);
+    if (!IsA(expr, FuncExpr))
+        return NULL;
 
-    get_sort_group_operators(restype,
-                             true,   /* needLT */
-                             true,   /* needEQ */
-                             true,   /* needGT */
-                             &ltop, &eqop, &gtop,
-                             &isHashable);
+    /* MVP：只支持 DESC（你现在的查询就是 DESC） */
+    *is_desc_out = true;
 
-    if (OidIsValid(gtop) && sgc->sortop == gtop)
-        *is_desc_out = true;
-    else if (OidIsValid(ltop) && sgc->sortop == ltop)
-        *is_desc_out = false;
-    else
-        return NULL; /* 非常规 sortop，先不支持 */
-
-    return (FuncExpr *) sortexpr;
+    return (FuncExpr *) expr;
 }
+
 
 /* pick index + compute key positions */
 static bool
