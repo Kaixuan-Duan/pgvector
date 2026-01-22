@@ -15,6 +15,8 @@
 #include <math.h>
 #include "hnswtopk.h"
 
+#include "utils/lsyscache.h"   /* get_op_rettype */
+
 /*
  * 可选：如果你 multi-scan 依赖 scan->opaque->col（而不是仅靠 sk_attno 推导），
  * 可以在 hnswscan.c 里提供一个非 static 的 setter，然后这里调用。
@@ -110,10 +112,14 @@ HnswTopKForColumn(Relation heapRel,
 
         out[n].tid = scan->xs_heaptid;
 
+        /* distance 是可选调试字段：一定要防御，避免 xs_orderbyvals 为空导致崩溃 */
+        out[n].distance = 0.0;
+
         /*
          * 你现在普通 IndexScan+ORDER BY 能工作，说明 AM 很可能设置了 xs_orderbyvals[0]
          * 如果这里读出来不对/为空，你可以在 AM 里确保对每个返回的 tid 都写 xs_orderbyvals。
          */
+        /*
         if (scan->xs_orderbynulls && scan->xs_orderbynulls[0])
         {
             out[n].distance = HUGE_VAL;
@@ -121,6 +127,25 @@ HnswTopKForColumn(Relation heapRel,
         else
         {
             out[n].distance = DatumGetFloat8(scan->xs_orderbyvals[0]);
+        }
+        */
+        if (scan->xs_orderbyvals != NULL &&
+            scan->xs_orderbynulls != NULL &&
+            !scan->xs_orderbynulls[0])
+        {
+            Oid rettype = get_op_rettype(orderby_op);
+
+            if (rettype == FLOAT8OID)
+                out[n].distance = DatumGetFloat8(scan->xs_orderbyvals[0]);
+            else if (rettype == FLOAT4OID)
+                out[n].distance = (float8) DatumGetFloat4(scan->xs_orderbyvals[0]);
+            else
+                out[n].distance = 0.0; /* 不认识的返回类型就别读了 */
+        }
+        else
+        {
+            /* 没有返回 distance，也不要崩；你也可以用 HUGE_VAL 表示 unknown */
+            out[n].distance = HUGE_VAL;
         }
 
         n++;

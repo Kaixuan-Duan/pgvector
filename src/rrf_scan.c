@@ -128,6 +128,40 @@ static CustomExecMethods vector_rrf_exec_methods = {
     .ExplainCustomScan = vector_rrf_explain
 };
 
+static inline bool
+rrf_funcid_is_rrf(Oid funcid)
+{
+    HeapTuple tup;
+    Form_pg_proc proc;
+    bool ok = false;
+
+    if (!OidIsValid(funcid))
+        return false;
+
+    tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+    if (!HeapTupleIsValid(tup)) {
+        elog(LOG, "VectorRRF: funcid %u not found in pg_proc (maybe operator oid?)", funcid);
+        return false; /* 注意：这里就是避免 function 67837 这种炸点 */
+    }
+
+    proc = (Form_pg_proc) GETSTRUCT(tup);
+    ok = (strcmp(NameStr(proc->proname), "rrf") == 0);
+
+    ReleaseSysCache(tup);
+    return ok;
+}
+
+
+static void
+rrf_assert_expr_type(Expr *e, const char *what)
+{
+    Oid t = exprType((Node *) e);
+    if (!OidIsValid(t))
+        ereport(ERROR,
+                (errmsg("rrf: %s has invalid type Oid=0, node=%s",
+                        what, nodeToString(e))));
+}
+
 /* ---------------- CustomPath planning ---------------- */
 
 static Plan *vector_rrf_plan_custom_path(PlannerInfo *root,
@@ -224,25 +258,41 @@ find_rrf_sort_expr(PlannerInfo *root, bool *is_desc_out)
     if (q->sortClause == NIL || list_length(q->sortClause) != 1)
         return NULL;
 
-    SortGroupClause *sgc = (SortGroupClause *) linitial(q->sortClause);
+    SortGroupClause *sgc = linitial_node(SortGroupClause, q->sortClause);
 
-    TargetEntry *tle = find_tle_by_sortgroupref(q->targetList, sgc->tleSortGroupRef);
-    if (tle == NULL)
+    /* 取 ORDER BY 对应的真实表达式（支持 ORDER BY 别名 s1） */
+    Expr *sortexpr = (Expr *) get_sortgroupclause_expr(sgc, q->targetList);
+    if (sortexpr == NULL)
         return NULL;
 
-    Expr *expr = strip_expr_wrappers((Expr *) tle->expr);
-    if (!IsA(expr, FuncExpr))
+    sortexpr = strip_expr_wrappers(sortexpr);
+    if (!IsA(sortexpr, FuncExpr))
         return NULL;
 
-    /* PG17 有 reverse_sort：true 表示 DESC */
-    // *is_desc_out = sgc->reverse_sort;
-    // *is_desc_out = false;  // 默认 ASC
-    (void) sgc->sortop;
-    (void) sgc->nulls_first;
-    *is_desc_out = true;
+    /*
+     * 通过 sortop 判断 ASC/DESC：
+     * sgc->sortop 是 operator OID（不是 function OID）
+     */
+    Oid restype = exprType((Node *) sortexpr);
 
+    Oid ltop = InvalidOid, eqop = InvalidOid, gtop = InvalidOid;
+    bool isHashable = false;
 
-    return (FuncExpr *) expr;
+    get_sort_group_operators(restype,
+                             true,   /* needLT */
+                             true,   /* needEQ */
+                             true,   /* needGT */
+                             &ltop, &eqop, &gtop,
+                             &isHashable);
+
+    if (OidIsValid(gtop) && sgc->sortop == gtop)
+        *is_desc_out = true;
+    else if (OidIsValid(ltop) && sgc->sortop == ltop)
+        *is_desc_out = false;
+    else
+        return NULL; /* 非常规 sortop，先不支持 */
+
+    return (FuncExpr *) sortexpr;
 }
 
 /* pick index + compute key positions */
@@ -290,13 +340,12 @@ replace_rrf_with_score_var_mutator(Node *node, void *ctx)
     if (IsA(node, FuncExpr))
     {
         FuncExpr *fe = (FuncExpr *) node;
-        const char *fname = get_func_name(fe->funcid);
 
-        if (fname && strcmp(fname, "rrf") == 0)
+        if (rrf_funcid_is_rrf(fe->funcid))
         {
-            /* use INDEX_VAR to reference custom scan tuple attribute */
             return (Node *) makeVar(INDEX_VAR, score_resno, FLOAT8OID, -1, InvalidOid, 0);
         }
+
     }
 
     return expression_tree_mutator(node, replace_rrf_with_score_var_mutator, ctx);
@@ -342,18 +391,34 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
     {
         Form_pg_attribute att = TupleDescAttr(desc, attno - 1);
 
-        Var *v = makeVar(rel->relid,
-                         attno,
-                         att->atttypid,
-                         att->atttypmod,
-                         att->attcollation,
-                         0);
+        Expr *expr;
+        char *colname;
 
-        TargetEntry *tle = makeTargetEntry((Expr *) v, attno,
-                                           pstrdup(NameStr(att->attname)),
-                                           false);
+        if (att->attisdropped || !OidIsValid(att->atttypid))
+        {
+            /*
+             * dropped 列 atttypid=0，不能 makeVar，否则 planner 会 cache lookup type 0
+             * 这里用一个“有类型”的 NULL 占位，并且保持 resno=attno 不变
+             */
+            expr = (Expr *) makeNullConst(TEXTOID, -1, InvalidOid);
+            colname = pstrdup("dropped");
+        }
+        else
+        {
+            Var *v = makeVar(rel->relid,
+                             attno,
+                             att->atttypid,
+                             att->atttypmod,
+                             att->attcollation,
+                             0);
+            expr = (Expr *) v;
+            colname = pstrdup(NameStr(att->attname));
+        }
+
+        TargetEntry *tle = makeTargetEntry(expr, attno, colname, false);
         scan_tlist = lappend(scan_tlist, tle);
     }
+
 
     /* last column is score */
     int score_resno = natts + 1;
@@ -389,8 +454,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     if (fe == NULL)
         return;
 
-    const char *fname = get_func_name(fe->funcid);
-    if (!fname || strcmp(fname, "rrf") != 0)
+    if (!rrf_funcid_is_rrf(fe->funcid))
         return;
 
     if (!is_desc)
@@ -405,14 +469,26 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
         return;
 
     Expr *emb1 = strip_expr_wrappers((Expr *) list_nth(fe->args, 0));
-    Expr *op1  = strip_expr_wrappers((Expr *) list_nth(fe->args, 1));
-    Expr *q1   = strip_expr_wrappers((Expr *) list_nth(fe->args, 2));
+    //Expr *op1  = strip_expr_wrappers((Expr *) list_nth(fe->args, 1));
+    //Expr *q1   = strip_expr_wrappers((Expr *) list_nth(fe->args, 2));
     Expr *emb2 = strip_expr_wrappers((Expr *) list_nth(fe->args, 3));
-    Expr *op2  = strip_expr_wrappers((Expr *) list_nth(fe->args, 4));
-    Expr *q2   = strip_expr_wrappers((Expr *) list_nth(fe->args, 5));
+    //Expr *op2  = strip_expr_wrappers((Expr *) list_nth(fe->args, 4));
+    //Expr *q2   = strip_expr_wrappers((Expr *) list_nth(fe->args, 5));
+
+    /* op/q 必须保留原始 typed node（不要 strip） */
+    Expr *op1  = (Expr *) list_nth(fe->args, 1);
+    Expr *q1   = (Expr *) list_nth(fe->args, 2);
+    Expr *op2  = (Expr *) list_nth(fe->args, 4);
+    Expr *q2   = (Expr *) list_nth(fe->args, 5);
 
     if (!IsA(emb1, Var) || !IsA(emb2, Var))
         return;
+
+    /* 在 append 前检查 */
+    rrf_assert_expr_type(op1, "op1");
+    rrf_assert_expr_type(q1,  "q1");
+    rrf_assert_expr_type(op2, "op2");
+    rrf_assert_expr_type(q2,  "q2");
 
     Var *v1 = (Var *) emb1;
     Var *v2 = (Var *) emb2;
@@ -445,12 +521,20 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->path.param_info = NULL;
     cpath->path.rows = rel->rows;
 
+    /* 必须：否则 create_projection_path 会崩 */
+    cpath->path.pathtarget = rel->reltarget;
+
     /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
     cpath->path.startup_cost = 0;
     cpath->path.total_cost = 1;
 
     /* 告诉 planner：我能提供 query 的排序（避免额外 Sort） */
     cpath->path.pathkeys = root->query_pathkeys;
+
+    /* 避免未初始化字段在 planner 其它分支被用到 */
+    cpath->path.parallel_aware = false;
+    cpath->path.parallel_safe = rel->consider_parallel;
+    cpath->path.parallel_workers = 0;
 
     cpath->methods = &vector_rrf_path_methods;
 
