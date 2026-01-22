@@ -29,6 +29,11 @@
 #include "optimizer/paths.h"
 #include "optimizer/clauses.h"
 #include "nodes/parsenodes.h"
+
+#include "access/htup_details.h"
+#include "utils/syscache.h"
+#include "optimizer/tlist.h"
+
 extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 
 void VectorRrfInit(void);
@@ -235,19 +240,7 @@ cmp_rrf_item_desc(const void *a, const void *b)
     return 0;
 }
 
-/* 不用 get_sortgroupclause_tle，手工按 tleSortGroupRef 匹配 */
-static TargetEntry *
-find_tle_by_sortgroupref(List *tlist, Index ref)
-{
-    ListCell *lc;
-    foreach (lc, tlist)
-    {
-        TargetEntry *tle = (TargetEntry *) lfirst(lc);
-        if (tle->ressortgroupref == ref)
-            return tle;
-    }
-    return NULL;
-}
+
 
 /* Find rrf() in ORDER BY target entry (MVP: single sort key, DESC only) */
 static FuncExpr *
