@@ -105,15 +105,6 @@ HnswTopKForColumn(Relation heapRel,
                            orderby_proc,        /* **重要**：距离算子 Oid */
                            query);            /* sk_argument: query vector Datum */
 
-    /*
-     * 同时把 operator OID 填进 scan 描述符（很多 AM / 计划展示会看这个）
-     * 注意：这些数组在 index_beginscan 后才可用
-     */
-    scan->orderByOperators[0]  = orderby_op;
-    scan->orderByCollations[0] = InvalidOid;
-    scan->orderByNullsFirst[0] = false;
-
-    /* 触发 AM rescan（HNSW AM 会在这里或首次 getnext_tid 初始化候选集） */
     index_rescan(scan, NULL, 0, &orderbykey, 1);
 
 #ifdef HNSW_HAVE_SCAN_SET_COLUMN
