@@ -37,6 +37,12 @@
 #include "utils/fmgroids.h"
 #include "catalog/indexing.h"
 
+#include "parser/parse_func.h"   /* FuncnameGetCandidates, FuncCandidateList */
+#include "nodes/pg_list.h"       /* List, T_OidList */
+
+#include "catalog/namespace.h"  /* FuncnameGetCandidates */
+
+
 extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 
 void VectorRrfInit(void);
@@ -148,34 +154,39 @@ load_rrf_func_oids(void)
     List *fname;
     FuncCandidateList clist;
 
-    /*
-     * 已经初始化过就不再做（即使为空，也表示“查过了”）
-     * 避免每次 planner hook 都重复查 catalog。
-     */
     if (rrf_func_oids_inited)
         return;
 
-    /*
-     * 防御：如果 rrf_func_oids 被踩坏（不是 OidList），丢弃它重新建。
-     * 这能避免你现在看到的 IsOidList(list) 断言直接 abort。
-     */
+    /* 防御：如果被踩坏，不是 OidList，直接丢弃重建 */
     if (rrf_func_oids != NIL && rrf_func_oids->type != T_OidList)
         rrf_func_oids = NIL;
 
     oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
-    /*
-     * 通过解析器工具函数枚举当前 search_path 下可见的所有 rrf 重载。
-     * 这通常和 SQL 里实际能解析到的 rrf() 一致，足够用于识别。
-     */
     fname = list_make1(makeString("rrf"));
+
+#if PG_VERSION_NUM >= 170000
+    /*
+     * PG17: FuncnameGetCandidates() 多了一个参数（通常是 missing_ok）
+     * 这里传 true：找不到也别报错，返回空即可
+     */
     clist = FuncnameGetCandidates(fname,
-                                 -1,    /* nargs: -1 表示不限定参数个数 */
+                                 -1,    /* nargs */
+                                 NIL,   /* argnames */
+                                 false, /* expand_variadic */
+                                 false, /* expand_defaults */
+                                 false, /* include_out_arguments */
+                                 true   /* missing_ok */
+                                 );
+#else
+    clist = FuncnameGetCandidates(fname,
+                                 -1,    /* nargs */
                                  NIL,   /* argnames */
                                  false, /* expand_variadic */
                                  false, /* expand_defaults */
                                  false  /* include_out_arguments */
                                  );
+#endif
 
     for (; clist != NULL; clist = clist->next)
         rrf_func_oids = lappend_oid(rrf_func_oids, clist->oid);
