@@ -45,6 +45,8 @@ static Oid rrf_func_oid = InvalidOid;
 static bool rrf_oids_loaded = false;
 static List *rrf_func_oids = NIL;
 
+static bool rrf_func_oids_inited = false;
+
 /* ---------------- Result structs ---------------- */
 
 typedef struct RRFResultItem
@@ -142,46 +144,45 @@ static CustomExecMethods vector_rrf_exec_methods = {
 static void
 load_rrf_func_oids(void)
 {
-    Relation    rel;
-    SysScanDesc scan;
-    HeapTuple   tup;
-    ScanKeyData key;
-    NameData    procname;
-
-    if (rrf_oids_loaded)
-        return;
-
-    namestrcpy(&procname, "rrf");
-
-    rel = table_open(ProcedureRelationId, AccessShareLock);
+    MemoryContext oldcxt;
+    List *fname;
+    FuncCandidateList clist;
 
     /*
-     * 用 pg_proc_proname_args_nsp_index（ProcedureNameArgsNspIndexId）做“前缀 key”扫描：
-     * 只用 proname 一个 key，就能扫出所有 proname='rrf' 的函数（含重载）。
+     * 已经初始化过就不再做（即使为空，也表示“查过了”）
+     * 避免每次 planner hook 都重复查 catalog。
      */
-    ScanKeyInit(&key,
-                Anum_pg_proc_proname,
-                BTEqualStrategyNumber,
-                F_NAMEEQ,
-                NameGetDatum(&procname));
+    if (rrf_func_oids_inited)
+        return;
 
-    scan = systable_beginscan(rel,
-                             ProcedureNameArgsNspIndexId,
-                             true,      /* use index */
-                             NULL,
-                             1,         /* nkeys: 只用 proname */
-                             &key);
+    /*
+     * 防御：如果 rrf_func_oids 被踩坏（不是 OidList），丢弃它重新建。
+     * 这能避免你现在看到的 IsOidList(list) 断言直接 abort。
+     */
+    if (rrf_func_oids != NIL && rrf_func_oids->type != T_OidList)
+        rrf_func_oids = NIL;
 
-    while (HeapTupleIsValid(tup = systable_getnext(scan)))
-    {
-        Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tup);
-        rrf_func_oids = lappend_oid(rrf_func_oids, proc->oid);
-    }
+    oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
-    systable_endscan(scan);
-    table_close(rel, AccessShareLock);
+    /*
+     * 通过解析器工具函数枚举当前 search_path 下可见的所有 rrf 重载。
+     * 这通常和 SQL 里实际能解析到的 rrf() 一致，足够用于识别。
+     */
+    fname = list_make1(makeString("rrf"));
+    clist = FuncnameGetCandidates(fname,
+                                 -1,    /* nargs: -1 表示不限定参数个数 */
+                                 NIL,   /* argnames */
+                                 false, /* expand_variadic */
+                                 false, /* expand_defaults */
+                                 false  /* include_out_arguments */
+                                 );
 
-    rrf_oids_loaded = true;
+    for (; clist != NULL; clist = clist->next)
+        rrf_func_oids = lappend_oid(rrf_func_oids, clist->oid);
+
+    rrf_func_oids_inited = true;
+
+    MemoryContextSwitchTo(oldcxt);
 }
 
 
@@ -194,14 +195,26 @@ rrf_funcid_is_rrf(Oid maybe_funcid)
         return false;
 
 #ifdef OPEROID
-    /* 保险：如果它其实是 operator OID（你现在遇到的就是这种），直接返回 false */
+    /*
+     * 保险：如果它其实是 operator OID（你之前遇到过），直接返回 false。
+     * （避免把 operator oid 误判成 func oid）
+     */
     if (SearchSysCacheExists1(OPEROID, ObjectIdGetDatum(maybe_funcid)))
         return false;
 #endif
 
     load_rrf_func_oids();
 
-    /* 命中任何一个叫 rrf 的函数 OID，就认为是 rrf（支持重载） */
+    /*
+     * 防御：如果确实没有任何 rrf（例如没在 search_path / 没装扩展），返回 false。
+     */
+    if (rrf_func_oids == NIL)
+        return false;
+
+    /*
+     * 这里不会再触发 IsOidList，因为我们保证只用 lappend_oid 建 OidList，
+     * 且全程在 TopMemoryContext 分配。
+     */
     return list_member_oid(rrf_func_oids, maybe_funcid);
 }
 
