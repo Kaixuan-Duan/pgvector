@@ -33,6 +33,7 @@
 #include "access/htup_details.h"
 #include "utils/syscache.h"
 #include "optimizer/tlist.h"
+#include "catalog/pg_operator.h"
 
 extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 
@@ -135,27 +136,41 @@ static CustomExecMethods vector_rrf_exec_methods = {
 };
 
 static inline bool
-rrf_funcid_is_rrf(Oid funcid)
+rrf_funcid_is_rrf(Oid maybe_funcid)
 {
-    HeapTuple tup;
+    HeapTuple    tup;
     Form_pg_proc proc;
 
-    if (!OidIsValid(funcid))
+    if (!OidIsValid(maybe_funcid))
         return false;
 
-    /* 已缓存则直接比 OID */
+    /* fast path：已经缓存过 rrf 的函数 OID，就只做 OID 比较 */
     if (OidIsValid(rrf_func_oid))
-        return funcid == rrf_func_oid;
+        return (maybe_funcid == rrf_func_oid);
 
-    /* 首次：查 pg_proc 看名字是否 rrf */
-    tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+#ifdef OPEROID
+    /*
+     * 关键防线：如果这个 OID 实际上是 operator（比如你现在的 75351），
+     * 那它一定不是函数，更不可能是 rrf()。
+     */
+    if (SearchSysCacheExists1(OPEROID, ObjectIdGetDatum(maybe_funcid)))
+        return false;
+#endif
+
+    /*
+     * 查 pg_proc：找不到就直接返回 false（绝不报错）。
+     * 注意：会报 “cache lookup failed for function …” 的通常是 get_func_name() 这种
+     * “找不到就 elog(ERROR)” 的封装；我们这里不会。
+     */
+    tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(maybe_funcid));
     if (!HeapTupleIsValid(tup))
-        return false;  /* funcid 不在 pg_proc：直接当不是 rrf */
+        return false;
 
     proc = (Form_pg_proc) GETSTRUCT(tup);
+
     if (strcmp(NameStr(proc->proname), "rrf") == 0)
     {
-        rrf_func_oid = funcid;  /* 缓存下来 */
+        rrf_func_oid = maybe_funcid;  /* 缓存下来，后续只比 OID */
         ReleaseSysCache(tup);
         return true;
     }
