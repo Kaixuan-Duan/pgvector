@@ -738,7 +738,9 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     memset(&ctl, 0, sizeof(ctl));
     ctl.keysize = sizeof(uint64);
     ctl.entrysize = sizeof(RRFHashEntry);
-    HTAB *ht = hash_create("rrf_hash", n1 + n2, &ctl, HASH_ELEM);
+    // HTAB *ht = hash_create("rrf_hash", n1 + n2, &ctl, HASH_ELEM);
+    HTAB *ht = hash_create("rrf_hash", Max(n1 + n2, 16), &ctl, HASH_ELEM | HASH_BLOBS);
+
 
     /* 路1 */
     for (int i = 0; i < n1; i++)
