@@ -40,6 +40,8 @@ extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 void VectorRrfInit(void);
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static Oid rrf_func_oid = InvalidOid;
+static bool rrf_oids_loaded = false;
+static List *rrf_func_oids = NIL;
 
 /* ---------------- Result structs ---------------- */
 
@@ -135,48 +137,70 @@ static CustomExecMethods vector_rrf_exec_methods = {
     .ExplainCustomScan = vector_rrf_explain
 };
 
+static void
+load_rrf_func_oids(void)
+{
+    Relation    rel;
+    SysScanDesc scan;
+    HeapTuple   tup;
+    ScanKeyData key;
+    NameData    procname;
+
+    if (rrf_oids_loaded)
+        return;
+
+    namestrcpy(&procname, "rrf");
+
+    rel = table_open(ProcedureRelationId, AccessShareLock);
+
+    /*
+     * 用 pg_proc_proname_args_nsp_index（ProcNameArgsNspIndexId）做“前缀 key”扫描：
+     * 只用 proname 一个 key，就能扫出所有 proname='rrf' 的函数（含重载）。
+     */
+    ScanKeyInit(&key,
+                Anum_pg_proc_proname,
+                BTEqualStrategyNumber,
+                F_NAMEEQ,
+                NameGetDatum(&procname));
+
+    scan = systable_beginscan(rel,
+                             ProcNameArgsNspIndexId,
+                             true,      /* use index */
+                             NULL,
+                             1,         /* nkeys: 只用 proname */
+                             &key);
+
+    while (HeapTupleIsValid(tup = systable_getnext(scan)))
+    {
+        Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tup);
+        rrf_func_oids = lappend_oid(rrf_func_oids, proc->oid);
+    }
+
+    systable_endscan(scan);
+    table_close(rel, AccessShareLock);
+
+    rrf_oids_loaded = true;
+}
+
+
+
+
 static inline bool
 rrf_funcid_is_rrf(Oid maybe_funcid)
 {
-    HeapTuple    tup;
-    Form_pg_proc proc;
-
     if (!OidIsValid(maybe_funcid))
         return false;
 
-    /* fast path：已经缓存过 rrf 的函数 OID，就只做 OID 比较 */
-    if (OidIsValid(rrf_func_oid))
-        return (maybe_funcid == rrf_func_oid);
-
 #ifdef OPEROID
-    /*
-     * 关键防线：如果这个 OID 实际上是 operator（比如你现在的 75351），
-     * 那它一定不是函数，更不可能是 rrf()。
-     */
+    /* 保险：如果它其实是 operator OID（你现在遇到的就是这种），直接返回 false */
     if (SearchSysCacheExists1(OPEROID, ObjectIdGetDatum(maybe_funcid)))
         return false;
 #endif
 
-    /*
-     * 查 pg_proc：找不到就直接返回 false（绝不报错）。
-     * 注意：会报 “cache lookup failed for function …” 的通常是 get_func_name() 这种
-     * “找不到就 elog(ERROR)” 的封装；我们这里不会。
-     */
-    tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(maybe_funcid));
-    if (!HeapTupleIsValid(tup))
-        return false;
+    load_rrf_func_oids();
 
-    proc = (Form_pg_proc) GETSTRUCT(tup);
-
-    if (strcmp(NameStr(proc->proname), "rrf") == 0)
-    {
-        rrf_func_oid = maybe_funcid;  /* 缓存下来，后续只比 OID */
-        ReleaseSysCache(tup);
-        return true;
-    }
-
-    ReleaseSysCache(tup);
-    return false;
+    /* 命中任何一个叫 rrf 的函数 OID，就认为是 rrf（支持重载） */
+    return list_member_oid(rrf_func_oids, maybe_funcid);
 }
 
 
