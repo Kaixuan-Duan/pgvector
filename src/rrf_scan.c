@@ -38,6 +38,7 @@ extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 
 void VectorRrfInit(void);
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+static Oid rrf_func_oid = InvalidOid;
 
 /* ---------------- Result structs ---------------- */
 
@@ -138,23 +139,31 @@ rrf_funcid_is_rrf(Oid funcid)
 {
     HeapTuple tup;
     Form_pg_proc proc;
-    bool ok = false;
 
     if (!OidIsValid(funcid))
         return false;
 
+    /* 已缓存则直接比 OID */
+    if (OidIsValid(rrf_func_oid))
+        return funcid == rrf_func_oid;
+
+    /* 首次：查 pg_proc 看名字是否 rrf */
     tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-    if (!HeapTupleIsValid(tup)) {
-        elog(LOG, "VectorRRF: funcid %u not found in pg_proc (maybe operator oid?)", funcid);
-        return false; /* 注意：这里就是避免 function 67837 这种炸点 */
-    }
+    if (!HeapTupleIsValid(tup))
+        return false;  /* funcid 不在 pg_proc：直接当不是 rrf */
 
     proc = (Form_pg_proc) GETSTRUCT(tup);
-    ok = (strcmp(NameStr(proc->proname), "rrf") == 0);
+    if (strcmp(NameStr(proc->proname), "rrf") == 0)
+    {
+        rrf_func_oid = funcid;  /* 缓存下来 */
+        ReleaseSysCache(tup);
+        return true;
+    }
 
     ReleaseSysCache(tup);
-    return ok;
+    return false;
 }
+
 
 
 static void
