@@ -16,6 +16,7 @@
 #include "hnswtopk.h"
 
 #include "utils/lsyscache.h"   /* get_op_rettype */
+#include "utils/errcodes.h"
 
 /*
  * 可选：如果你 multi-scan 依赖 scan->opaque->col（而不是仅靠 sk_attno 推导），
@@ -35,7 +36,7 @@ int
 HnswTopKForColumn(Relation heapRel,
                   Relation indexRel,
                   int col,
-                  Oid orderby_op,
+                  Oid orderby_op,     /* operator OID, e.g. <-> / <#> / <=> */
                   Datum query,
                   int topk,
                   HnswTopKItem *out,
@@ -62,7 +63,19 @@ HnswTopKForColumn(Relation heapRel,
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("orderby operator OID is invalid"),
-                 errhint("Pass the operator OID from the distance OpExpr (e.g. <->, <#>, <=>) via planner custom_private.")));
+                 errhint("Pass the operator OID from the distance OpExpr (e.g. <->, <#>, <=>).")));
+
+    /*
+     * 关键修复：
+     * ScanKeyEntryInitialize 的 “procedure” 参数必须是 *function OID* (pg_proc)。
+     * 你之前传的是 operator OID，内核会把它当函数去查 pg_proc，导致
+     * cache lookup failed for function <operator_oid>
+     */
+    Oid orderby_proc = get_opcode(orderby_op);  /* operator -> underlying function OID */
+    if (!OidIsValid(orderby_proc))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("orderby operator OID %u has no underlying procedure", orderby_op)));
 
     /* executor 期间一般都有 active snapshot */
     snapshot = GetActiveSnapshot();
@@ -70,6 +83,7 @@ HnswTopKForColumn(Relation heapRel,
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("no active snapshot")));
+
 
     /*
      * nkeys=0 (不走 WHERE 过滤), norderbys=1 (KNN orderby)
@@ -88,15 +102,18 @@ HnswTopKForColumn(Relation heapRel,
                            InvalidStrategy,   /* 对 orderby key 通常不需要 strategy */
                            InvalidOid,        /* subtype */
                            InvalidOid,        /* collation: 向量一般无 collation */
-                           orderby_op,        /* **重要**：距离算子 Oid */
+                           orderby_proc,        /* **重要**：距离算子 Oid */
                            query);            /* sk_argument: query vector Datum */
 
-    /* 把 orderby operator/collation 也填进 scan 描述符（很多 AM 会看这里） */
-    // scan->orderByOperators[0] = orderby_op;
-    // scan->orderByCollations[0] = InvalidOid;
-    // scan->orderByNullsFirst[0] = false;
+    /*
+     * 同时把 operator OID 填进 scan 描述符（很多 AM / 计划展示会看这个）
+     * 注意：这些数组在 index_beginscan 后才可用
+     */
+    scan->orderByOperators[0]  = orderby_op;
+    scan->orderByCollations[0] = InvalidOid;
+    scan->orderByNullsFirst[0] = false;
 
-    /* 触发 AM rescan（你的 HNSW 会在这里或首次 getnext_tid 初始化候选集） */
+    /* 触发 AM rescan（HNSW AM 会在这里或首次 getnext_tid 初始化候选集） */
     index_rescan(scan, NULL, 0, &orderbykey, 1);
 
 #ifdef HNSW_HAVE_SCAN_SET_COLUMN
@@ -112,40 +129,25 @@ HnswTopKForColumn(Relation heapRel,
 
         out[n].tid = scan->xs_heaptid;
 
-        /* distance 是可选调试字段：一定要防御，避免 xs_orderbyvals 为空导致崩溃 */
-        out[n].distance = 0.0;
+        /* distance 是可选字段：要防御 xs_orderbyvals 为空 */
+        out[n].distance = HUGE_VAL;
 
-        /*
-         * 你现在普通 IndexScan+ORDER BY 能工作，说明 AM 很可能设置了 xs_orderbyvals[0]
-         * 如果这里读出来不对/为空，你可以在 AM 里确保对每个返回的 tid 都写 xs_orderbyvals。
-         */
-        /*
-        if (scan->xs_orderbynulls && scan->xs_orderbynulls[0])
-        {
-            out[n].distance = HUGE_VAL;
-        }
-        else
-        {
-            out[n].distance = DatumGetFloat8(scan->xs_orderbyvals[0]);
-        }
-        */
         if (scan->xs_orderbyvals != NULL &&
             scan->xs_orderbynulls != NULL &&
             !scan->xs_orderbynulls[0])
         {
-            Oid rettype = get_op_rettype(orderby_op);
+            /*
+             * 更稳：用 underlying procedure 的返回类型判断
+             * （也可以用 get_op_rettype(orderby_op)，但这里已经有 orderby_proc 了）
+             */
+            Oid rettype = get_func_rettype(orderby_proc);
 
             if (rettype == FLOAT8OID)
                 out[n].distance = DatumGetFloat8(scan->xs_orderbyvals[0]);
             else if (rettype == FLOAT4OID)
                 out[n].distance = (float8) DatumGetFloat4(scan->xs_orderbyvals[0]);
             else
-                out[n].distance = 0.0; /* 不认识的返回类型就别读了 */
-        }
-        else
-        {
-            /* 没有返回 distance，也不要崩；你也可以用 HUGE_VAL 表示 unknown */
-            out[n].distance = HUGE_VAL;
+                out[n].distance = 0.0; /* 不认识的返回类型就别强读 */
         }
 
         n++;

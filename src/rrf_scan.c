@@ -34,6 +34,8 @@
 #include "utils/syscache.h"
 #include "optimizer/tlist.h"
 #include "catalog/pg_operator.h"
+#include "utils/fmgroids.h"
+#include "catalog/indexing.h"
 
 extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 
@@ -154,7 +156,7 @@ load_rrf_func_oids(void)
     rel = table_open(ProcedureRelationId, AccessShareLock);
 
     /*
-     * 用 pg_proc_proname_args_nsp_index（ProcNameArgsNspIndexId）做“前缀 key”扫描：
+     * 用 pg_proc_proname_args_nsp_index（ProcedureNameArgsNspIndexId）做“前缀 key”扫描：
      * 只用 proname 一个 key，就能扫出所有 proname='rrf' 的函数（含重载）。
      */
     ScanKeyInit(&key,
@@ -164,7 +166,7 @@ load_rrf_func_oids(void)
                 NameGetDatum(&procname));
 
     scan = systable_beginscan(rel,
-                             ProcNameArgsNspIndexId,
+                             ProcedureNameArgsNspIndexId,
                              true,      /* use index */
                              NULL,
                              1,         /* nkeys: 只用 proname */
