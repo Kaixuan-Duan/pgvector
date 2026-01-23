@@ -782,7 +782,7 @@ create_custom_scan_plan_tlist(List *query_tlist, int score_resno, Index scanreli
          */
         if (IsA(expr, FuncExpr) && rrf_funcid_is_rrf(((FuncExpr *)expr)->funcid))
         {
-            new_expr = (Node *) makeVar(INDEX_VAR,
+            new_expr = (Node *) makeVar(scanrelid,
                                         score_resno,
                                         FLOAT8OID,
                                         -1,
