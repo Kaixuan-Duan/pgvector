@@ -291,6 +291,9 @@ hnswbeginscanmulti(Relation index, int nkeys, int norderbys)
 	{
 		HnswScanOpaque so = &soMulti->cols[col];
 
+		so->orderby_op = InvalidOid;
+		so->orderby_proc = InvalidOid;
+
 		/* typeInfo 必须按列取，支持不同向量类型 */
 		so->typeInfo = HnswGetTypeInfoColumn(index, col);
 
@@ -390,6 +393,9 @@ hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys,
 	for (int i = 0; i < soMulti->nkeys; i++)
 	{
 		HnswScanOpaque so = &soMulti->cols[i];
+
+		so->orderby_op = InvalidOid;
+		so->orderby_proc = InvalidOid;
 
 		so->first = true;
 		/* v and discarded are allocated in tmpCtx */

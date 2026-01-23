@@ -414,6 +414,9 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	Oid         orderby_op;     /* operator OID: <-> / <#> / <=> */
+	Oid         orderby_proc;   /* underlying proc OID (get_opcode(orderby_op) or sk_func) */
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -576,6 +579,8 @@ void		hnswendscan(IndexScanDesc scan);
 void		hnswendscanmulti(IndexScanDesc scan);
 void		hnswendscan_dispatch(IndexScanDesc scan);
 
+void HnswScanSetColumn(IndexScanDesc scan, int col);
+void HnswScanSetOrderByOp(IndexScanDesc scan, Oid orderby_op);
 
 static inline HnswNeighborArray *
 HnswGetNeighbors(char *base, HnswElement element, int lc)

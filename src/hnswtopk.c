@@ -18,19 +18,48 @@
 #include "utils/lsyscache.h"   /* get_op_rettype */
 #include "utils/errcodes.h"
 
-/*
- * 可选：如果你 multi-scan 依赖 scan->opaque->col（而不是仅靠 sk_attno 推导），
- * 可以在 hnswscan.c 里提供一个非 static 的 setter，然后这里调用。
- *
- * 例如在 hnswscan.c 中实现：
- *   void HnswScanSetColumn(IndexScanDesc scan, int col);
- *
- * 如果你的实现已经是从 orderByData[0].sk_attno 推导列（你历史里建议过这种做法），
- * 那下面这个 extern 和调用都可以删掉。
- */
-#ifdef HNSW_HAVE_SCAN_SET_COLUMN
-extern void HnswScanSetColumn(IndexScanDesc scan, int col);
-#endif
+#include "hnsw.h"
+
+
+void
+HnswScanSetColumn(IndexScanDesc scan, int col)
+{
+    HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+
+    if (soMulti == NULL)
+        elog(ERROR, "HnswScanSetColumn: scan->opaque is NULL");
+
+    if (col < 0 || col >= soMulti->nkeys)
+        elog(ERROR, "HnswScanSetColumn: col out of range: %d (nkeys=%d)",
+             col, soMulti->nkeys);
+
+    soMulti->col = col;
+}
+
+void
+HnswScanSetOrderByOp(IndexScanDesc scan, Oid orderby_op)
+{
+    HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+    int col;
+
+    if (soMulti == NULL)
+        elog(ERROR, "HnswScanSetOrderByOp: scan->opaque is NULL");
+
+    col = soMulti->col;
+
+    if (col < 0 || col >= soMulti->nkeys)
+        elog(ERROR, "HnswScanSetOrderByOp: col out of range: %d (nkeys=%d)",
+             col, soMulti->nkeys);
+
+    soMulti->cols[col].orderby_op = orderby_op;
+    soMulti->cols[col].orderby_proc = get_opcode(orderby_op);
+
+    /* 可选：这里不 ERROR，只做日志；真正用时再 ERROR 也行 */
+    if (!OidIsValid(soMulti->cols[col].orderby_proc))
+        elog(WARNING, "HnswScanSetOrderByOp: op=%u has invalid proc (col=%d)",
+             orderby_op, col);
+}
+
 
 int
 HnswTopKForColumn(Relation heapRel,
@@ -62,8 +91,7 @@ HnswTopKForColumn(Relation heapRel,
     if (!OidIsValid(orderby_op))
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("orderby operator OID is invalid"),
-                 errhint("Pass the operator OID from the ORDER BY distance operator (e.g. <->, <#>, <=>).")));
+                 errmsg("orderby operator OID is invalid")));
 
     /*
      * 关键修复：ScanKeyEntryInitialize 的 sk_func 必须是 pg_proc 里的函数 OID
@@ -91,27 +119,27 @@ HnswTopKForColumn(Relation heapRel,
     elog(WARNING, "HnswTopKForColumn: op=%u proc=%u col=%d", orderby_op, orderby_proc, col);
 
     /*
-     * 设置 order-by key：
-     * - sk_attno：1-based 的 index key attribute number
-     * - sk_func：必须是函数 OID（orderby_proc）
-     * - sk_argument：query 向量 datum
+     * ORDER BY key：
+     * - flags: SK_ORDER_BY
+     * - sk_attno: 1-based key attno
+     * - sk_func: underlying proc oid
+     * - sk_argument: query datum
      */
     ScanKeyEntryInitialize(&orderbykey,
-                           0,                 /* flags */
-                           (AttrNumber) (col + 1), /* sk_attno: 1-based key attno */
-                           InvalidStrategy,   /* 对 orderby key 通常不需要 strategy */
-                           InvalidOid,        /* subtype */
-                           InvalidOid,        /* collation: 向量一般无 collation */
-                           orderby_proc,        /* **重要**：距离算子 Oid */
-                           query);            /* sk_argument: query vector Datum */
+                           SK_ORDER_BY,
+                           (AttrNumber) (col + 1),
+                           InvalidStrategy,
+                           InvalidOid,
+                           InvalidOid,
+                           orderby_proc,
+                           query);
 
     /* 触发 AM rescan（HNSW AM 通常在这里或首次 getnext_tid 初始化候选集） */
     index_rescan(scan, NULL, 0, &orderbykey, 1);
 
-#ifdef HNSW_HAVE_SCAN_SET_COLUMN
-    /* 如果你的 multi 实现必须依赖 opaque->col，就强制设一下 */
-    HnswScanSetColumn(scan, col);
-#endif
+    /* rescan 之后再 set，避免被 rescan 清掉 */
+    HnswScanSetColumn(scan, col);              /* 可选但建议 */
+    HnswScanSetOrderByOp(scan, orderby_op);    /* 关键：必须在 rescan 后 */
 
     while (n < topk)
     {
@@ -121,7 +149,7 @@ HnswTopKForColumn(Relation heapRel,
 
         if (!ItemPointerIsValid(&scan->xs_heaptid))
             ereport(ERROR,
-                    (errmsg("HnswTopKForColumn: index_getnext_tid returned invalid TID (col=%d, op=%u)",
+                    (errmsg("HnswTopKForColumn: invalid xs_heaptid (col=%d op=%u)",
                             col, orderby_op)));
 
         out[n].tid = scan->xs_heaptid;
