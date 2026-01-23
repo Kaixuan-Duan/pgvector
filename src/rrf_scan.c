@@ -395,11 +395,14 @@ pick_index_for_vars(RelOptInfo *rel, Var *v1, Var *v2, Oid *indexoid_out, int *c
     return false;
 }
 
+/* 上下文结构体增加 scanrelid */
 typedef struct ReplaceRrfOuterCtx
 {
-    int score_resno;
+    int   score_resno;
+    Index scanrelid;   /* 新增：基表的 RTI */
 } ReplaceRrfOuterCtx;
 
+/* 更新 Mutator 函数 */
 static Node *
 replace_rrf_with_outer_var_mutator(Node *node, void *ctx)
 {
@@ -408,12 +411,12 @@ replace_rrf_with_outer_var_mutator(Node *node, void *ctx)
     if (node == NULL)
         return NULL;
 
+    /* 1. 如果是 rrf() 函数，替换为 score 列 (OUTER_VAR) */
     if (IsA(node, FuncExpr))
     {
         FuncExpr *fe = (FuncExpr *) node;
         if (rrf_funcid_is_rrf(fe->funcid))
         {
-            /* 关键：引用子计划输出列 */
             return (Node *) makeVar(OUTER_VAR,
                                     rctx->score_resno,
                                     FLOAT8OID,
@@ -423,17 +426,38 @@ replace_rrf_with_outer_var_mutator(Node *node, void *ctx)
         }
     }
 
+    /* 2. [新增关键修复] 如果是基表的 Var，替换为对应的 OUTER_VAR */
+    if (IsA(node, Var))
+    {
+        Var *v = (Var *) node;
+        /* 如果这个 Var 指向我们的基表 (test2) */
+        if (v->varno == rctx->scanrelid)
+        {
+            /* * 这里的逻辑前提是：CustomScan 的输出列顺序与表结构完全一致。
+             * 所以表的第 N 列，就是 CustomScan 输出的第 N 列。
+             */
+            return (Node *) makeVar(OUTER_VAR,
+                                    v->varattno,
+                                    v->vartype,
+                                    v->vartypmod,
+                                    v->varcollid,
+                                    0);
+        }
+    }
+
     return expression_tree_mutator(node, replace_rrf_with_outer_var_mutator, ctx);
 }
 
+/* 注意：增加参数 scanrelid */
 static List *
-replace_rrf_in_tlist_with_outer_var(List *tlist, int score_resno)
+replace_rrf_in_tlist_with_outer_var(List *tlist, int score_resno, Index scanrelid)
 {
     List *out = NIL;
     ListCell *lc;
 
     ReplaceRrfOuterCtx ctx;
     ctx.score_resno = score_resno;
+    ctx.scanrelid = scanrelid; /* 传入 relid */
 
     foreach (lc, tlist)
     {
@@ -672,50 +696,39 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
                         (Expr *) root->parse->limitCount :
                         make_int4_const(0);
 
-    /*
-     * ✅ 手工构造 CustomPath：关键是别把 pathtype 设成 T_CustomScan
-     *    pathtype 用 “CustomPath 自身” 的类型（在你的环境里，最稳的是 T_CustomScan=?? 反而会误导 core）
-     */
+    /* ---- 正确构造 CustomPath ---- */
     CustomPath *cpath = makeNode(CustomPath);
 
-    /* ---- Path 基类必须初始化到“planner 不会误判”的最小集合 ---- */
-    cpath->path.parent = rel;
-
     /*
-     * ✅ 关键修复点：
-     *    不要写 T_CustomScan（你之前写它导致 create_scan_plan 走 IndexPath 分支）
-     *    这里用 CustomPath 自身的 pathtype 标识。
-     *
-     *    在多数 PG 版本中，pathtype 允许为 T_CustomScan 作为 path type，
-     *    但你这里已经证明它会触发错误分支，所以这里必须换。
+     * nodeTag(cpath) == T_CustomPath 是正常的（结构体类型）
+     * 但 “扫描类型” 必须放在 pathtype 里：T_CustomScan
      */
-    cpath->path.pathtype = T_CustomPath;
-
-    /* 让 core 自己做投影/上层 ProjectionPath */
+    cpath->path.pathtype   = T_CustomScan;
+    cpath->path.parent     = rel;
     cpath->path.pathtarget = rel->reltarget;
 
-    /* 不宣称排序，避免 planner 深处分支依赖 pathkeys */
-    cpath->path.pathkeys = NIL;
+    /* 先别宣称有序，避免 planner 依赖 pathkeys 做复杂推导 */
+    cpath->path.pathkeys   = NIL;
 
-    /* rows 要有一个合理值，否则一些成本/分支会出现奇怪行为 */
-    cpath->path.rows = rel->rows > 0 ? rel->rows : 1;
-
-    /* param_info 一般可以 NULL（非参数化路径） */
+    /* 非参数化路径 */
     cpath->path.param_info = NULL;
 
-    /* 并行信息保守 */
-    cpath->path.parallel_aware = false;
-    cpath->path.parallel_safe = rel->consider_parallel;
+    /* rows 必须给一个合理值 */
+    cpath->path.rows = (rel->rows > 0) ? rel->rows : 1;
+
+    /* 成本先保守，先跑通 */
+    cpath->path.startup_cost = 0;
+    cpath->path.total_cost   = 10;
+
+    /* 并行保守 */
+    cpath->path.parallel_aware   = false;
+    cpath->path.parallel_safe    = rel->consider_parallel;
     cpath->path.parallel_workers = 0;
 
-    /* 成本先给保守值，先保证 EXPLAIN 不炸 */
-    cpath->path.startup_cost = 0;
-    cpath->path.total_cost = 10;
-
-    /* ---- CustomPath 自身字段 ---- */
     cpath->methods = &vector_rrf_path_methods;
     cpath->custom_paths = NIL;
 
+    /* custom_private: 传给 PlanCustomPath / executor */
     cpath->custom_private = NIL;
     cpath->custom_private = lappend(cpath->custom_private, makeInteger((int) indexoid));
     cpath->custom_private = lappend(cpath->custom_private, makeInteger(col1));
@@ -732,15 +745,82 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand2_expr));
 
     elog(WARNING,
-         "VectorRRF add_path: nodeTag=%d pathtype=%d (T_CustomPath=%d)",
+         "VectorRRF add_path: ptr=%p nodeTag=%d pathtype=%d (expect nodeTag=%d pathtype=%d)",
+         (void *) cpath,
          (int) nodeTag(cpath),
          (int) cpath->path.pathtype,
-         (int) T_CustomPath);
+         (int) T_CustomPath,
+         (int) T_CustomScan);
+
+    elog(WARNING, "Debug RRF: My T_CustomScan int value = %d, cpath->pathtype = %d, NodeTag = %d",
+     (int)T_CustomScan, (int)cpath->path.pathtype, (int)nodeTag(cpath));
 
     add_path(rel, (Path *) cpath);
 }
 
+
 /* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
+/* 辅助函数：将 Query 的 tlist 映射为 CustomScan 的 plan.targetlist
+ * 将 rrf(...) 替换为引用 custom_scan_tlist 的 Var(INDEX_VAR, score_resno)
+ * 将 Table Var 替换为引用 custom_scan_tlist 的 Var(INDEX_VAR, attno)
+ */
+static List *
+create_custom_scan_plan_tlist(List *query_tlist, int score_resno, Index scanrelid)
+{
+    List *out = NIL;
+    ListCell *lc;
+
+    foreach (lc, query_tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        Node *expr = (Node *) tle->expr;
+        Node *new_expr = NULL;
+
+        /* 1. 【特殊处理】 rrf() 函数 -> 替换为物理引用 (INDEX_VAR)
+         * 因为 rrf 不是表里的列，我们需要告诉执行器：
+         * "不要计算 rrf，直接去 ScanTuple 的第 score_resno 列拿数据"
+         */
+        if (IsA(expr, FuncExpr) && rrf_funcid_is_rrf(((FuncExpr *)expr)->funcid))
+        {
+            new_expr = (Node *) makeVar(INDEX_VAR,
+                                        score_resno,
+                                        FLOAT8OID,
+                                        -1,
+                                        InvalidOid,
+                                        0);
+        }
+        /* 2. 【关键修复】 普通表列 -> 保持原样 (varno=scanrelid)
+         * 不要改成 INDEX_VAR！
+         * 上层节点（如 Limit）还在找 Var(varno=scanrelid)，改成 INDEX_VAR 会导致匹配失败。
+         * * 只要这个 Var 在 custom_scan_tlist 里有对应的列（我们 build 时保证了这一点），
+         * 执行器运行时会自动处理映射。
+         */
+        else if (IsA(expr, Var))
+        {
+            Var *v = (Var *) expr;
+            if (v->varno == scanrelid)
+            {
+                new_expr = (Node *) copyObject(expr); /* 保持原样！ */
+            }
+        }
+
+        /* 其他情况（如常量），直接拷贝 */
+        if (new_expr == NULL)
+            new_expr = (Node *) copyObject(expr);
+
+        /* 再次确保 pstrdup 安全 */
+        char *new_resname = (tle->resname != NULL) ? pstrdup(tle->resname) : NULL;
+
+        TargetEntry *new_tle = makeTargetEntry((Expr *) new_expr,
+                                               tle->resno,
+                                               new_resname,
+                                               tle->resjunk);
+
+        new_tle->ressortgroupref = tle->ressortgroupref;
+        out = lappend(out, new_tle);
+    }
+    return out;
+}
 
 static Plan *
 vector_rrf_plan_custom_path(PlannerInfo *root,
@@ -750,47 +830,32 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
                             List *clauses,
                             List *custom_plans)
 {
-    elog(WARNING, "VectorRRF PlanCustomPath called: best_path=%p nodeTag=%d pathtype=%d",
-     best_path, nodeTag(best_path), best_path->path.pathtype);
+    elog(WARNING, "DEBUG: PlanCustomPath start (simplified).");
 
     CustomScan *cscan = makeNode(CustomScan);
-
     cscan->methods = &vector_rrf_scan_methods;
     cscan->custom_private = best_path->custom_private;
     cscan->custom_plans = NIL;
     cscan->custom_exprs = NIL;
-
     cscan->scan.scanrelid = rel->relid;
 
-    /* 1) CustomScan 的 scan tuple：所有表列 + score */
+    /* 1. 构建物理输出列 (custom_scan_tlist): 表列 + score */
     int score_resno = 0;
     cscan->custom_scan_tlist = build_custom_scan_tlist_for_table(root, rel, &score_resno);
 
-    /*
-     * 2) 关键：CustomScan 自己的 plan.targetlist 也用“全列 + score”
-     *    这样上层 OUTER_VAR 才能引用到 score_resno
+    /* 2. 构建逻辑输出列 (plan.targetlist)
+     * 直接映射 Query 的要求，不再需要 Result 节点。
+     * 这里的 Var 使用 INDEX_VAR，指向上面的 custom_scan_tlist。
      */
-    cscan->scan.plan.targetlist = copyObject(cscan->custom_scan_tlist);
+    cscan->scan.plan.targetlist = create_custom_scan_plan_tlist(tlist, score_resno, rel->relid);
 
-    /* quals 放在 CustomScan 本身 */
+    /* 3. 处理 Quals */
     cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
 
-    /* 3) 在 CustomScan 上面包一层 Result，做最终输出投影 */
-    Result *res = makeNode(Result);
-    res->plan.lefttree = &cscan->scan.plan;
-    res->plan.righttree = NULL;
-    res->resconstantqual = NULL;
+    elog(WARNING, "DEBUG: PlanCustomPath finished (returning CustomScan directly).");
 
-    /* 把 query 的 tlist 里的 rrf(...) 替换成 Var(OUTER_VAR, score_resno) */
-    res->plan.targetlist = replace_rrf_in_tlist_with_outer_var(tlist, score_resno);
-
-    /*
-     * Result 这里一般不再需要 qual（如果你确实有额外 qual，也可以放这里）
-     * 保守起见置空
-     */
-    res->plan.qual = NIL;
-
-    return &res->plan;
+    /* 直接返回 CustomScan，不再包裹 Result */
+    return &cscan->scan.plan;
 }
 
 /* ---------- Executor skeleton (MVP: error) ---------- */
@@ -972,6 +1037,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
 static void
 vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
 {
+    elog(WARNING, "DEBUG: 8. vector_rrf_begin called");
     VectorRRFScanState *st = (VectorRRFScanState *) node;
     CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 
