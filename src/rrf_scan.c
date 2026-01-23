@@ -395,11 +395,70 @@ pick_index_for_vars(RelOptInfo *rel, Var *v1, Var *v2, Oid *indexoid_out, int *c
     return false;
 }
 
-/* mutator: replace rrf(...) with Var(INDEX_VAR, score_resno) */
+typedef struct ReplaceRrfOuterCtx
+{
+    int score_resno;
+} ReplaceRrfOuterCtx;
+
+static Node *
+replace_rrf_with_outer_var_mutator(Node *node, void *ctx)
+{
+    ReplaceRrfOuterCtx *rctx = (ReplaceRrfOuterCtx *) ctx;
+
+    if (node == NULL)
+        return NULL;
+
+    if (IsA(node, FuncExpr))
+    {
+        FuncExpr *fe = (FuncExpr *) node;
+        if (rrf_funcid_is_rrf(fe->funcid))
+        {
+            /* 关键：引用子计划输出列 */
+            return (Node *) makeVar(OUTER_VAR,
+                                    rctx->score_resno,
+                                    FLOAT8OID,
+                                    -1,
+                                    InvalidOid,
+                                    0);
+        }
+    }
+
+    return expression_tree_mutator(node, replace_rrf_with_outer_var_mutator, ctx);
+}
+
+static List *
+replace_rrf_in_tlist_with_outer_var(List *tlist, int score_resno)
+{
+    List *out = NIL;
+    ListCell *lc;
+
+    ReplaceRrfOuterCtx ctx;
+    ctx.score_resno = score_resno;
+
+    foreach (lc, tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        TargetEntry *ntle = copyObject(tle);
+
+        ntle->expr = (Expr *) replace_rrf_with_outer_var_mutator((Node *) ntle->expr, &ctx);
+        out = lappend(out, ntle);
+    }
+
+    return out;
+}
+
+
+typedef struct ReplaceRrfCtx
+{
+    Index scanrelid;     /* rel->relid */
+    int   score_resno;   /* natts + 1 */
+} ReplaceRrfCtx;
+
+/* mutator: replace rrf(...) with Var(scanrelid, score_resno) */
 static Node *
 replace_rrf_with_score_var_mutator(Node *node, void *ctx)
 {
-    int score_resno = *((int *) ctx);
+    ReplaceRrfCtx *rctx = (ReplaceRrfCtx *) ctx;
 
     if (node == NULL)
         return NULL;
@@ -410,33 +469,45 @@ replace_rrf_with_score_var_mutator(Node *node, void *ctx)
 
         if (rrf_funcid_is_rrf(fe->funcid))
         {
-            return (Node *) makeVar(INDEX_VAR, score_resno, FLOAT8OID, -1, InvalidOid, 0);
+            /*
+             * 关键修复：
+             * CustomScan 输出列引用必须用 Var(scanrelid, resno)，
+             * 不能用 INDEX_VAR，否则 setrefs 会报 “variable not found in subplan target list”.
+             */
+            return (Node *) makeVar(rctx->scanrelid,
+                                    rctx->score_resno,
+                                    FLOAT8OID,
+                                    -1,
+                                    InvalidOid,
+                                    0);
         }
-
     }
 
     return expression_tree_mutator(node, replace_rrf_with_score_var_mutator, ctx);
 }
 
 static List *
-replace_rrf_in_tlist(List *tlist, int score_resno)
+replace_rrf_in_tlist(List *tlist, Index scanrelid, int score_resno)
 {
     List *out = NIL;
     ListCell *lc;
+
+    ReplaceRrfCtx ctx;
+    ctx.scanrelid = scanrelid;
+    ctx.score_resno = score_resno;
 
     foreach (lc, tlist)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
         TargetEntry *ntle = copyObject(tle);
 
-        int ctx = score_resno;
         ntle->expr = (Expr *) replace_rrf_with_score_var_mutator((Node *) ntle->expr, &ctx);
-
         out = lappend(out, ntle);
     }
 
     return out;
 }
+
 
 /* mutator: replace rrf(...) with Const(0.0::float8) for PathTarget only */
 static Node *
@@ -704,17 +775,35 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
 
     cscan->scan.scanrelid = rel->relid;
 
-    /* build scan tuple (all columns + score) */
+    /* 1) CustomScan 的 scan tuple：所有表列 + score */
     int score_resno = 0;
     cscan->custom_scan_tlist = build_custom_scan_tlist_for_table(root, rel, &score_resno);
 
-    /* rewrite rrf(...) in this plan node targetlist to Var(INDEX_VAR, score_resno) */
-    List *rewritten_tlist = replace_rrf_in_tlist(tlist, score_resno);
+    /*
+     * 2) 关键：CustomScan 自己的 plan.targetlist 也用“全列 + score”
+     *    这样上层 OUTER_VAR 才能引用到 score_resno
+     */
+    cscan->scan.plan.targetlist = copyObject(cscan->custom_scan_tlist);
 
-    cscan->scan.plan.targetlist = rewritten_tlist;
+    /* quals 放在 CustomScan 本身 */
     cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
 
-    return &cscan->scan.plan;
+    /* 3) 在 CustomScan 上面包一层 Result，做最终输出投影 */
+    Result *res = makeNode(Result);
+    res->plan.lefttree = &cscan->scan.plan;
+    res->plan.righttree = NULL;
+    res->resconstantqual = NULL;
+
+    /* 把 query 的 tlist 里的 rrf(...) 替换成 Var(OUTER_VAR, score_resno) */
+    res->plan.targetlist = replace_rrf_in_tlist_with_outer_var(tlist, score_resno);
+
+    /*
+     * Result 这里一般不再需要 qual（如果你确实有额外 qual，也可以放这里）
+     * 保守起见置空
+     */
+    res->plan.qual = NIL;
+
+    return &res->plan;
 }
 
 /* ---------- Executor skeleton (MVP: error) ---------- */
