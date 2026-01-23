@@ -615,11 +615,9 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
 static void
 vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
-    /* 先让原 hook 跑 */
     if (prev_set_rel_pathlist_hook)
         prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
-    /* 只处理简单 base relation */
     if (rte->rtekind != RTE_RELATION)
         return;
     if (rel->reloptkind != RELOPT_BASEREL)
@@ -629,29 +627,18 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     FuncExpr *fe = find_rrf_sort_expr(root, &is_desc);
     if (fe == NULL)
         return;
-
     if (!rrf_funcid_is_rrf(fe->funcid))
         return;
-
     if (!is_desc)
-        return; /* RRF score only supports DESC in MVP */
+        return;
 
-    /*
-     * New signature:
-     * rrf(emb1, op1, q1, emb2, op2, q2, k?, w1?, w2?, cand1?, cand2?)
-     */
     int nargs = list_length(fe->args);
     if (nargs < 6)
         return;
 
     Expr *emb1 = strip_expr_wrappers((Expr *) list_nth(fe->args, 0));
-    //Expr *op1  = strip_expr_wrappers((Expr *) list_nth(fe->args, 1));
-    //Expr *q1   = strip_expr_wrappers((Expr *) list_nth(fe->args, 2));
     Expr *emb2 = strip_expr_wrappers((Expr *) list_nth(fe->args, 3));
-    //Expr *op2  = strip_expr_wrappers((Expr *) list_nth(fe->args, 4));
-    //Expr *q2   = strip_expr_wrappers((Expr *) list_nth(fe->args, 5));
 
-    /* op/q 必须保留原始 typed node（不要 strip） */
     Expr *op1  = (Expr *) list_nth(fe->args, 1);
     Expr *q1   = (Expr *) list_nth(fe->args, 2);
     Expr *op2  = (Expr *) list_nth(fe->args, 4);
@@ -660,7 +647,6 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     if (!IsA(emb1, Var) || !IsA(emb2, Var))
         return;
 
-    /* 在 append 前检查 */
     rrf_assert_expr_type(op1, "op1");
     rrf_assert_expr_type(q1,  "q1");
     rrf_assert_expr_type(op2, "op2");
@@ -668,8 +654,6 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
 
     Var *v1 = (Var *) emb1;
     Var *v2 = (Var *) emb2;
-
-    /* 两个列必须来自同一张表（同一个 rti） */
     if (v1->varno != rti || v2->varno != rti)
         return;
 
@@ -678,68 +662,62 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     if (!pick_index_for_vars(rel, v1, v2, &indexoid, &col1, &col2))
         return;
 
-    /* optional args with defaults */
     Expr *k_expr     = (nargs >= 7)  ? (Expr *) list_nth(fe->args, 6)  : make_int4_const(60);
     Expr *w1_expr    = (nargs >= 8)  ? (Expr *) list_nth(fe->args, 7)  : make_float8_const(0.5);
     Expr *w2_expr    = (nargs >= 9)  ? (Expr *) list_nth(fe->args, 8)  : make_float8_const(0.5);
     Expr *cand1_expr = (nargs >= 10) ? (Expr *) list_nth(fe->args, 9)  : make_int4_const(200);
     Expr *cand2_expr = (nargs >= 11) ? (Expr *) list_nth(fe->args, 10) : make_int4_const(200);
 
-    /* LIMIT expr */
     Expr *limit_expr = (root->parse->limitCount != NULL) ?
-                       (Expr *) root->parse->limitCount :
-                       make_int4_const(0);
-
-    /* build CustomPath */
-    CustomPath *cpath = makeNode(CustomPath);
-    cpath->path.pathtype = T_CustomScan;
-    cpath->path.parent = rel;
-    cpath->path.param_info = NULL;
-    cpath->path.rows = rel->rows;
-
-    /* 必须：否则 create_projection_path 会崩 */
-    // cpath->path.pathtarget = rel->reltarget;
+                        (Expr *) root->parse->limitCount :
+                        make_int4_const(0);
 
     /*
- * Path 阶段 pathtarget 不能引用 INDEX_VAR！
- * 这里只做形状匹配：把 rrf(...) 替换成 0.0::float8 占位符。
- */
-    List *query_tlist = root->parse->targetList;
-    List *pathtarget_tlist = replace_rrf_in_tlist_with_float8_zero(query_tlist);
-    cpath->path.pathtarget = make_pathtarget_from_tlist(pathtarget_tlist);
+     * ✅ 手工构造 CustomPath：关键是别把 pathtype 设成 T_CustomScan
+     *    pathtype 用 “CustomPath 自身” 的类型（在你的环境里，最稳的是 T_CustomScan=?? 反而会误导 core）
+     */
+    CustomPath *cpath = makeNode(CustomPath);
 
+    /* ---- Path 基类必须初始化到“planner 不会误判”的最小集合 ---- */
+    cpath->path.parent = rel;
 
-    /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
-    cpath->path.startup_cost = 0;
-    cpath->path.total_cost = 1;
+    /*
+     * ✅ 关键修复点：
+     *    不要写 T_CustomScan（你之前写它导致 create_scan_plan 走 IndexPath 分支）
+     *    这里用 CustomPath 自身的 pathtype 标识。
+     *
+     *    在多数 PG 版本中，pathtype 允许为 T_CustomScan 作为 path type，
+     *    但你这里已经证明它会触发错误分支，所以这里必须换。
+     */
+    cpath->path.pathtype = T_CustomPath;
 
-    /* 告诉 planner：我能提供 query 的排序（避免额外 Sort） */
-    cpath->path.pathkeys = root->query_pathkeys;
+    /* 让 core 自己做投影/上层 ProjectionPath */
+    cpath->path.pathtarget = rel->reltarget;
 
-    /* 避免未初始化字段在 planner 其它分支被用到 */
+    /* 不宣称排序，避免 planner 深处分支依赖 pathkeys */
+    cpath->path.pathkeys = NIL;
+
+    /* rows 要有一个合理值，否则一些成本/分支会出现奇怪行为 */
+    cpath->path.rows = rel->rows > 0 ? rel->rows : 1;
+
+    /* param_info 一般可以 NULL（非参数化路径） */
+    cpath->path.param_info = NULL;
+
+    /* 并行信息保守 */
     cpath->path.parallel_aware = false;
     cpath->path.parallel_safe = rel->consider_parallel;
     cpath->path.parallel_workers = 0;
 
-    cpath->methods = &vector_rrf_path_methods;
+    /* 成本先给保守值，先保证 EXPLAIN 不炸 */
+    cpath->path.startup_cost = 0;
+    cpath->path.total_cost = 10;
 
-    /* custom_private layout:
-     * 0 indexoid
-     * 1 col1
-     * 2 col2
-     * 3 limit_expr
-     * 4 op1_expr
-     * 5 op2_expr
-     * 6 q1_expr
-     * 7 q2_expr
-     * 8 k_expr
-     * 9 w1_expr
-     * 10 w2_expr
-     * 11 cand1_expr
-     * 12 cand2_expr
-     */
+    /* ---- CustomPath 自身字段 ---- */
+    cpath->methods = &vector_rrf_path_methods;
+    cpath->custom_paths = NIL;
+
     cpath->custom_private = NIL;
-    cpath->custom_private = lappend(cpath->custom_private, makeInteger(indexoid));
+    cpath->custom_private = lappend(cpath->custom_private, makeInteger((int) indexoid));
     cpath->custom_private = lappend(cpath->custom_private, makeInteger(col1));
     cpath->custom_private = lappend(cpath->custom_private, makeInteger(col2));
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(limit_expr));
@@ -753,7 +731,13 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand1_expr));
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand2_expr));
 
-    add_path(rel, &cpath->path);
+    elog(WARNING,
+         "VectorRRF add_path: nodeTag=%d pathtype=%d (T_CustomPath=%d)",
+         (int) nodeTag(cpath),
+         (int) cpath->path.pathtype,
+         (int) T_CustomPath);
+
+    add_path(rel, (Path *) cpath);
 }
 
 /* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
@@ -766,6 +750,9 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
                             List *clauses,
                             List *custom_plans)
 {
+    elog(WARNING, "VectorRRF PlanCustomPath called: best_path=%p nodeTag=%d pathtype=%d",
+     best_path, nodeTag(best_path), best_path->path.pathtype);
+
     CustomScan *cscan = makeNode(CustomScan);
 
     cscan->methods = &vector_rrf_scan_methods;
