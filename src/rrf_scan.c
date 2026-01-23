@@ -122,6 +122,9 @@ typedef struct VectorRRFScanState
     int cursor;
 
     MemoryContext rrf_mcxt;
+
+    /* heap fetch via index (handles HOT redirects) */
+    IndexFetchTableData *fetch;
 } VectorRRFScanState;
 
 /* ---------------- CustomScan method decls ---------------- */
@@ -899,6 +902,12 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
                                           RelationGetDescr(st->heapRel),
                                           &TTSOpsBufferHeapTuple);
 
+    /*
+     * IMPORTANT:
+     * Use index-fetch API so HOT root TIDs can be followed to visible tuple versions
+     * (same behavior as normal IndexScan executor path).
+     */
+    st->fetch = table_index_fetch_begin(st->heapRel);
 
     /* compute results */
     MemoryContextReset(st->rrf_mcxt);
@@ -938,18 +947,42 @@ vector_rrf_exec(CustomScanState *node)
         ExecClearTuple(st->heapSlot);
 
         /* 1) fetch heap tuple */
-        bool ok = table_tuple_fetch_row_version(st->heapRel,
-                                                &it->tid,
-                                                st->snapshot,
-                                                st->heapSlot);
+
+        bool ok = false;
+        bool call_again = false;
+        bool all_dead = false;
+
+        /*
+         * Use index fetch path: this follows HOT chains / redirect tuples
+         * and returns the visible version for the snapshot (like IndexScan does).
+         */
+        do {
+            call_again = false;
+            ExecClearTuple(st->heapSlot);
+
+#if PG_VERSION_NUM >= 160000
+            ok = table_index_fetch_tuple(st->fetch,
+                                         &it->tid,
+                                         st->snapshot,
+                                         st->heapSlot,
+                                         &call_again,
+                                         &all_dead);
+#else
+            /* older versions: signature may differ; keep for safety */
+            ok = table_index_fetch_tuple(st->fetch,
+                                         &it->tid,
+                                         st->snapshot,
+                                         st->heapSlot,
+                                         &call_again);
+#endif
+        } while (call_again);
 
         elog(WARNING,
-             "VectorRRF exec: fetch tid=%u/%u ok=%d heapSlot_ops=%p heapSlot=%p",
+             "VectorRRF exec: index_fetch tid=%u/%u ok=%d all_dead=%d",
              ItemPointerGetBlockNumber(&it->tid),
              ItemPointerGetOffsetNumber(&it->tid),
              (int) ok,
-             (void *) (st->heapSlot ? st->heapSlot->tts_ops : NULL),
-             (void *) st->heapSlot);
+             (int) all_dead);
 
         if (!ok)
             continue;
@@ -1023,6 +1056,10 @@ static void
 vector_rrf_end(CustomScanState *node)
 {
     VectorRRFScanState *st = (VectorRRFScanState *) node;
+
+    if (st->fetch)
+        table_index_fetch_end(st->fetch);
+    st->fetch = NULL;
 
     if (st->indexRel)
         index_close(st->indexRel, AccessShareLock);
