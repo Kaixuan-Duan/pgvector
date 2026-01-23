@@ -438,6 +438,44 @@ replace_rrf_in_tlist(List *tlist, int score_resno)
     return out;
 }
 
+/* mutator: replace rrf(...) with Const(0.0::float8) for PathTarget only */
+static Node *
+replace_rrf_with_float8_zero_mutator(Node *node, void *ctx)
+{
+    (void) ctx;
+
+    if (node == NULL)
+        return NULL;
+
+    if (IsA(node, FuncExpr))
+    {
+        FuncExpr *fe = (FuncExpr *) node;
+        if (rrf_funcid_is_rrf(fe->funcid))
+        {
+            return (Node *) make_float8_const(0.0);
+        }
+    }
+
+    return expression_tree_mutator(node, replace_rrf_with_float8_zero_mutator, NULL);
+}
+
+static List *
+replace_rrf_in_tlist_with_float8_zero(List *tlist)
+{
+    List *out = NIL;
+    ListCell *lc;
+
+    foreach (lc, tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        TargetEntry *ntle = copyObject(tle);
+        ntle->expr = (Expr *) replace_rrf_with_float8_zero_mutator((Node *) ntle->expr, NULL);
+        out = lappend(out, ntle);
+    }
+
+    return out;
+}
+
 /* Build custom_scan_tlist = all table columns + rrf_score placeholder */
 static List *
 build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score_resno_out)
@@ -589,7 +627,16 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->path.rows = rel->rows;
 
     /* 必须：否则 create_projection_path 会崩 */
-    cpath->path.pathtarget = rel->reltarget;
+    // cpath->path.pathtarget = rel->reltarget;
+
+    /*
+ * Path 阶段 pathtarget 不能引用 INDEX_VAR！
+ * 这里只做形状匹配：把 rrf(...) 替换成 0.0::float8 占位符。
+ */
+    List *query_tlist = root->parse->targetList;
+    List *pathtarget_tlist = replace_rrf_in_tlist_with_float8_zero(query_tlist);
+    cpath->path.pathtarget = make_pathtarget_from_tlist(pathtarget_tlist);
+
 
     /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
     cpath->path.startup_cost = 0;
