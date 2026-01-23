@@ -756,6 +756,9 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
                       st->cand1, list1, &n1);
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2,
                       st->cand2, list2, &n2);
+    elog(WARNING, "VectorRRF: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
+     st->op1, st->op2, st->cand1, st->cand2, n1, n2);
+
 
     /* merge by tid */
     HASHCTL ctl;
@@ -835,6 +838,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     st->results = arr;
     st->nresults = n;
     st->cursor = 0;
+    elog(WARNING, "VectorRRF: st->nresults=%d", n);
 
     MemoryContextSwitchTo(old);
 }
@@ -907,26 +911,61 @@ vector_rrf_exec(CustomScanState *node)
     VectorRRFScanState *st = (VectorRRFScanState *) node;
     ExprContext *econtext = node->ss.ps.ps_ExprContext;
 
-    TupleTableSlot *scanSlot = node->ss.ss_ScanTupleSlot;
+    TupleTableSlot *scanSlot   = node->ss.ss_ScanTupleSlot;
     TupleTableSlot *resultSlot = node->ss.ps.ps_ResultTupleSlot;
 
     while (st->cursor < st->nresults)
     {
+        int cur = st->cursor;              /* 当前要处理的下标 */
         RRFResultItem *it = &st->results[st->cursor++];
+
+        /* --- DEBUG: cursor / tid / score --- */
+        if (!ItemPointerIsValid(&it->tid))
+        {
+            elog(WARNING,
+                 "VectorRRF exec: invalid TID at cursor=%d/%d (score=%.6f)",
+                 cur, st->nresults, it->score);
+            continue;
+        }
+
+        elog(WARNING,
+             "VectorRRF exec: cursor=%d/%d tid=%u/%u score=%.6f",
+             cur, st->nresults,
+             ItemPointerGetBlockNumber(&it->tid),
+             ItemPointerGetOffsetNumber(&it->tid),
+             it->score);
 
         ExecClearTuple(st->heapSlot);
 
-        /* 1) 抓 heap tuple */
-        if (!table_tuple_fetch_row_version(st->heapRel, &it->tid,
-                                           st->snapshot, st->heapSlot))
+        /* 1) fetch heap tuple */
+        bool ok = table_tuple_fetch_row_version(st->heapRel,
+                                                &it->tid,
+                                                st->snapshot,
+                                                st->heapSlot);
+
+        elog(WARNING,
+             "VectorRRF exec: fetch tid=%u/%u ok=%d heapSlot_ops=%p heapSlot=%p",
+             ItemPointerGetBlockNumber(&it->tid),
+             ItemPointerGetOffsetNumber(&it->tid),
+             (int) ok,
+             (void *) (st->heapSlot ? st->heapSlot->tts_ops : NULL),
+             (void *) st->heapSlot);
+
+        if (!ok)
             continue;
 
         /* fill scanSlot = all heap cols + score (last) */
         ExecClearTuple(scanSlot);
+
+        /* Ensure heapSlot attrs are extracted */
         slot_getallattrs(st->heapSlot);
 
         int natts_heap = st->heapSlot->tts_tupleDescriptor->natts;
         int natts_scan = scanSlot->tts_tupleDescriptor->natts;
+
+        elog(WARNING,
+             "VectorRRF exec: natts_heap=%d natts_scan=%d (expect scan=heap+1)",
+             natts_heap, natts_scan);
 
         /* expect scan = heap + 1 */
         if (natts_scan != natts_heap + 1)
@@ -948,18 +987,37 @@ vector_rrf_exec(CustomScanState *node)
         /* qual */
         econtext->ecxt_scantuple = scanSlot;
         if (node->ss.ps.qual && !ExecQual(node->ss.ps.qual, econtext))
+        {
+            elog(WARNING,
+                 "VectorRRF exec: qual filtered tid=%u/%u",
+                 ItemPointerGetBlockNumber(&it->tid),
+                 ItemPointerGetOffsetNumber(&it->tid));
             continue;
+        }
 
         /* projection: fill ps_ResultTupleSlot and return */
         if (node->ss.ps.ps_ProjInfo)
-            return ExecProject(node->ss.ps.ps_ProjInfo);
+        {
+            TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
+            elog(WARNING,
+                 "VectorRRF exec: returned projected tuple for tid=%u/%u",
+                 ItemPointerGetBlockNumber(&it->tid),
+                 ItemPointerGetOffsetNumber(&it->tid));
+            return out;
+        }
 
         ExecCopySlot(resultSlot, scanSlot);
+        elog(WARNING,
+             "VectorRRF exec: returned tuple (no projection) for tid=%u/%u",
+             ItemPointerGetBlockNumber(&it->tid),
+             ItemPointerGetOffsetNumber(&it->tid));
         return resultSlot;
     }
 
+    elog(WARNING, "VectorRRF exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
     return NULL;
 }
+
 
 static void
 vector_rrf_end(CustomScanState *node)

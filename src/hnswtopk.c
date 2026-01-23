@@ -88,6 +88,8 @@ HnswTopKForColumn(Relation heapRel,
      */
     scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
 
+    elog(WARNING, "HnswTopKForColumn: op=%u proc=%u col=%d", orderby_op, orderby_proc, col);
+
     /*
      * 设置 order-by key：
      * - sk_attno：1-based 的 index key attribute number
@@ -116,6 +118,11 @@ HnswTopKForColumn(Relation heapRel,
         bool found = index_getnext_tid(scan, ForwardScanDirection);
         if (!found)
             break;
+
+        if (!ItemPointerIsValid(&scan->xs_heaptid))
+            ereport(ERROR,
+                    (errmsg("HnswTopKForColumn: index_getnext_tid returned invalid TID (col=%d, op=%u)",
+                            col, orderby_op)));
 
         out[n].tid = scan->xs_heaptid;
 
