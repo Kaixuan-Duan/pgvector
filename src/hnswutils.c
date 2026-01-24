@@ -814,36 +814,36 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
-
-	if (element->heaptidsLength > 0 && ItemPointerIsValid(&element->heaptids[0]))
-    {
-		elog(WARNING,
-			 "WRITE element: self_tid=%u/%u heap0=%u/%u heaptidsLen=%d",
-			 element->blkno, element->offno,
-			 ItemPointerGetBlockNumber(&element->heaptids[0]),
-			 ItemPointerGetOffsetNumber(&element->heaptids[0]),
-			 element->heaptidsLength);
-    }
-    else
-    {
-    	elog(WARNING,
-			 "WRITE element: self_tid=%u/%u heap0=INVALID heaptidsLen=%d",
-			 element->blkno, element->offno,
-			 element->heaptidsLength);
-    }
-
-    /* 再打印 tuple 里实际将要落盘的 heap tid（这是“结果”） */
-    if (ItemPointerIsValid(&etup->heaptids[0]))
-    {
-    	elog(WARNING,
-			 "WRITE tuple : heaptid0=%u/%u",
-			 ItemPointerGetBlockNumber(&etup->heaptids[0]),
-			 ItemPointerGetOffsetNumber(&etup->heaptids[0]));
-    }
-    else
-    {
-    	elog(WARNING, "WRITE tuple : heaptid0=INVALID");
-    }
+ //
+	// if (element->heaptidsLength > 0 && ItemPointerIsValid(&element->heaptids[0]))
+ //    {
+	// 	elog(WARNING,
+	// 		 "WRITE element: self_tid=%u/%u heap0=%u/%u heaptidsLen=%d",
+	// 		 element->blkno, element->offno,
+	// 		 ItemPointerGetBlockNumber(&element->heaptids[0]),
+	// 		 ItemPointerGetOffsetNumber(&element->heaptids[0]),
+	// 		 element->heaptidsLength);
+ //    }
+ //    else
+ //    {
+ //    	elog(WARNING,
+	// 		 "WRITE element: self_tid=%u/%u heap0=INVALID heaptidsLen=%d",
+	// 		 element->blkno, element->offno,
+	// 		 element->heaptidsLength);
+ //    }
+ //
+ //    /* 再打印 tuple 里实际将要落盘的 heap tid（这是“结果”） */
+ //    if (ItemPointerIsValid(&etup->heaptids[0]))
+ //    {
+ //    	elog(WARNING,
+	// 		 "WRITE tuple : heaptid0=%u/%u",
+	// 		 ItemPointerGetBlockNumber(&etup->heaptids[0]),
+	// 		 ItemPointerGetOffsetNumber(&etup->heaptids[0]));
+ //    }
+ //    else
+ //    {
+ //    	elog(WARNING, "WRITE tuple : heaptid0=INVALID");
+ //    }
 	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
 }
 
@@ -895,11 +895,11 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	element->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
 	element->heaptidsLength = 0;
 
-	elog(WARNING,
-	 "READ tuple : heaptid0=%u/%u",
-	 ItemPointerGetBlockNumber(&etup->heaptids[0]),
-	 ItemPointerGetOffsetNumber(&etup->heaptids[0]));
-
+	// elog(WARNING,
+	//  "READ tuple : heaptid0=%u/%u",
+	//  ItemPointerGetBlockNumber(&etup->heaptids[0]),
+	//  ItemPointerGetOffsetNumber(&etup->heaptids[0]));
+	//
 	if (loadHeaptids)
 	{
 		for (int i = 0; i < HNSW_HEAPTIDS; i++)
@@ -910,15 +910,15 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 
 			HnswAddHeapTid(element, &etup->heaptids[i]);
 		}
-		if (element->heaptidsLength > 0 && ItemPointerIsValid(&element->heaptids[0]))
-			elog(WARNING,
-				 "READ element: heap0=%u/%u heaptidsLen=%d",
-				 ItemPointerGetBlockNumber(&element->heaptids[0]),
-				 ItemPointerGetOffsetNumber(&element->heaptids[0]),
-				 element->heaptidsLength);
-		else
-			elog(WARNING, "READ element: heap0=INVALID heaptidsLen=%d", element->heaptidsLength);
-
+		// if (element->heaptidsLength > 0 && ItemPointerIsValid(&element->heaptids[0]))
+		// 	elog(WARNING,
+		// 		 "READ element: heap0=%u/%u heaptidsLen=%d",
+		// 		 ItemPointerGetBlockNumber(&element->heaptids[0]),
+		// 		 ItemPointerGetOffsetNumber(&element->heaptids[0]),
+		// 		 element->heaptidsLength);
+		// else
+		// 	elog(WARNING, "READ element: heap0=INVALID heaptidsLen=%d", element->heaptidsLength);
+		//
 	}
 
 	if (loadVec)
