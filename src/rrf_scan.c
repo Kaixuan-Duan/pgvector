@@ -596,7 +596,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->path.total_cost = 1;
 
     /* 告诉 planner：我能提供 query 的排序（避免额外 Sort） */
-    cpath->path.pathkeys = root->query_pathkeys;
+    cpath->path.pathkeys = root->sort_pathkeys;
 
     /* 避免未初始化字段在 planner 其它分支被用到 */
     cpath->path.parallel_aware = false;
