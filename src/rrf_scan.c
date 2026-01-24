@@ -42,6 +42,13 @@
 
 #include "catalog/namespace.h"  /* FuncnameGetCandidates */
 
+#include "nodes/nodeFuncs.h"   /* expression_tree_mutator/walker */
+
+#include "nodes/print.h"       /* pprint */
+#include "optimizer/clauses.h" /* extract_actual_clauses */
+#include "utils/elog.h"        /* elog */
+
+
 
 extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 
@@ -395,109 +402,26 @@ pick_index_for_vars(RelOptInfo *rel, Var *v1, Var *v2, Oid *indexoid_out, int *c
     return false;
 }
 
-/* 上下文结构体增加 scanrelid */
-typedef struct ReplaceRrfOuterCtx
+typedef struct ReplaceRrfPlanCtx
 {
+    Index scanrelid;
     int   score_resno;
-    Index scanrelid;   /* 新增：基表的 RTI */
-} ReplaceRrfOuterCtx;
-
-/* 更新 Mutator 函数 */
+} ReplaceRrfPlanCtx;
 static Node *
-replace_rrf_with_outer_var_mutator(Node *node, void *ctx)
+replace_rrf_with_score_var_plan_mutator(Node *node, void *ctx)
 {
-    ReplaceRrfOuterCtx *rctx = (ReplaceRrfOuterCtx *) ctx;
+    ReplaceRrfPlanCtx *rctx = (ReplaceRrfPlanCtx *) ctx;
 
     if (node == NULL)
         return NULL;
 
-    /* 1. 如果是 rrf() 函数，替换为 score 列 (OUTER_VAR) */
+    node = strip_implicit_coercions(node); /* 可选：更稳 */
+
     if (IsA(node, FuncExpr))
     {
         FuncExpr *fe = (FuncExpr *) node;
         if (rrf_funcid_is_rrf(fe->funcid))
         {
-            return (Node *) makeVar(OUTER_VAR,
-                                    rctx->score_resno,
-                                    FLOAT8OID,
-                                    -1,
-                                    InvalidOid,
-                                    0);
-        }
-    }
-
-    /* 2. [新增关键修复] 如果是基表的 Var，替换为对应的 OUTER_VAR */
-    if (IsA(node, Var))
-    {
-        Var *v = (Var *) node;
-        /* 如果这个 Var 指向我们的基表 (test2) */
-        if (v->varno == rctx->scanrelid)
-        {
-            /* * 这里的逻辑前提是：CustomScan 的输出列顺序与表结构完全一致。
-             * 所以表的第 N 列，就是 CustomScan 输出的第 N 列。
-             */
-            return (Node *) makeVar(OUTER_VAR,
-                                    v->varattno,
-                                    v->vartype,
-                                    v->vartypmod,
-                                    v->varcollid,
-                                    0);
-        }
-    }
-
-    return expression_tree_mutator(node, replace_rrf_with_outer_var_mutator, ctx);
-}
-
-/* 注意：增加参数 scanrelid */
-static List *
-replace_rrf_in_tlist_with_outer_var(List *tlist, int score_resno, Index scanrelid)
-{
-    List *out = NIL;
-    ListCell *lc;
-
-    ReplaceRrfOuterCtx ctx;
-    ctx.score_resno = score_resno;
-    ctx.scanrelid = scanrelid; /* 传入 relid */
-
-    foreach (lc, tlist)
-    {
-        TargetEntry *tle = (TargetEntry *) lfirst(lc);
-        TargetEntry *ntle = copyObject(tle);
-
-        ntle->expr = (Expr *) replace_rrf_with_outer_var_mutator((Node *) ntle->expr, &ctx);
-        out = lappend(out, ntle);
-    }
-
-    return out;
-}
-
-
-typedef struct ReplaceRrfCtx
-{
-    Index scanrelid;     /* rel->relid */
-    int   score_resno;   /* natts + 1 */
-} ReplaceRrfCtx;
-
-/* mutator: replace rrf(...) with Var(scanrelid, score_resno) */
-static Node *
-replace_rrf_with_score_var_mutator(Node *node, void *ctx)
-{
-    ReplaceRrfCtx *rctx = (ReplaceRrfCtx *) ctx;
-
-    if (node == NULL)
-        return NULL;
-
-    if (IsA(node, FuncExpr))
-    {
-        FuncExpr *fe = (FuncExpr *) node;
-
-        if (rrf_funcid_is_rrf(fe->funcid))
-        {
-            /*
-             * 关键修复：
-             * CustomScan 输出列引用必须用 Var(scanrelid, resno)，
-             * 不能用 INDEX_VAR，否则 setrefs 会报 “variable not found in subplan target list”.
-             */
             return (Node *) makeVar(rctx->scanrelid,
                                     rctx->score_resno,
                                     FLOAT8OID,
@@ -507,69 +431,9 @@ replace_rrf_with_score_var_mutator(Node *node, void *ctx)
         }
     }
 
-    return expression_tree_mutator(node, replace_rrf_with_score_var_mutator, ctx);
+    return expression_tree_mutator(node, replace_rrf_with_score_var_plan_mutator, ctx);
 }
 
-static List *
-replace_rrf_in_tlist(List *tlist, Index scanrelid, int score_resno)
-{
-    List *out = NIL;
-    ListCell *lc;
-
-    ReplaceRrfCtx ctx;
-    ctx.scanrelid = scanrelid;
-    ctx.score_resno = score_resno;
-
-    foreach (lc, tlist)
-    {
-        TargetEntry *tle = (TargetEntry *) lfirst(lc);
-        TargetEntry *ntle = copyObject(tle);
-
-        ntle->expr = (Expr *) replace_rrf_with_score_var_mutator((Node *) ntle->expr, &ctx);
-        out = lappend(out, ntle);
-    }
-
-    return out;
-}
-
-
-/* mutator: replace rrf(...) with Const(0.0::float8) for PathTarget only */
-static Node *
-replace_rrf_with_float8_zero_mutator(Node *node, void *ctx)
-{
-    (void) ctx;
-
-    if (node == NULL)
-        return NULL;
-
-    if (IsA(node, FuncExpr))
-    {
-        FuncExpr *fe = (FuncExpr *) node;
-        if (rrf_funcid_is_rrf(fe->funcid))
-        {
-            return (Node *) make_float8_const(0.0);
-        }
-    }
-
-    return expression_tree_mutator(node, replace_rrf_with_float8_zero_mutator, NULL);
-}
-
-static List *
-replace_rrf_in_tlist_with_float8_zero(List *tlist)
-{
-    List *out = NIL;
-    ListCell *lc;
-
-    foreach (lc, tlist)
-    {
-        TargetEntry *tle = (TargetEntry *) lfirst(lc);
-        TargetEntry *ntle = copyObject(tle);
-        ntle->expr = (Expr *) replace_rrf_with_float8_zero_mutator((Node *) ntle->expr, NULL);
-        out = lappend(out, ntle);
-    }
-
-    return out;
-}
 
 /* Build custom_scan_tlist = all table columns + rrf_score placeholder */
 static List *
@@ -707,8 +571,11 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->path.parent     = rel;
     cpath->path.pathtarget = rel->reltarget;
 
-    /* 先别宣称有序，避免 planner 依赖 pathkeys 做复杂推导 */
-    cpath->path.pathkeys   = NIL;
+    // /* 先别宣称有序，避免 planner 依赖 pathkeys 做复杂推导 */
+    // cpath->path.pathkeys   = NIL;
+
+    /* 告诉 planner：我能提供 query 的排序（避免额外 Sort） */
+    cpath->path.pathkeys = root->query_pathkeys;
 
     /* 非参数化路径 */
     cpath->path.param_info = NULL;
@@ -767,60 +634,27 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
 static List *
 create_custom_scan_plan_tlist(List *query_tlist, int score_resno, Index scanrelid)
 {
+    ReplaceRrfPlanCtx ctx;
+    ctx.scanrelid = scanrelid;
+    ctx.score_resno = score_resno;
+
     List *out = NIL;
     ListCell *lc;
 
     foreach (lc, query_tlist)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
-        Node *expr = (Node *) tle->expr;
-        Node *new_expr = NULL;
+        TargetEntry *ntle = copyObject(tle);
 
-        /* 1. 【特殊处理】 rrf() 函数 -> 替换为物理引用 (INDEX_VAR)
-         * 因为 rrf 不是表里的列，我们需要告诉执行器：
-         * "不要计算 rrf，直接去 ScanTuple 的第 score_resno 列拿数据"
-         */
-        if (IsA(expr, FuncExpr) && rrf_funcid_is_rrf(((FuncExpr *)expr)->funcid))
-        {
-            new_expr = (Node *) makeVar(scanrelid,
-                                        score_resno,
-                                        FLOAT8OID,
-                                        -1,
-                                        InvalidOid,
-                                        0);
-        }
-        /* 2. 【关键修复】 普通表列 -> 保持原样 (varno=scanrelid)
-         * 不要改成 INDEX_VAR！
-         * 上层节点（如 Limit）还在找 Var(varno=scanrelid)，改成 INDEX_VAR 会导致匹配失败。
-         * * 只要这个 Var 在 custom_scan_tlist 里有对应的列（我们 build 时保证了这一点），
-         * 执行器运行时会自动处理映射。
-         */
-        else if (IsA(expr, Var))
-        {
-            Var *v = (Var *) expr;
-            if (v->varno == scanrelid)
-            {
-                new_expr = (Node *) copyObject(expr); /* 保持原样！ */
-            }
-        }
+        /* ✅ 关键：无条件递归替换所有 rrf() */
+        ntle->expr = (Expr *) replace_rrf_with_score_var_plan_mutator((Node *) ntle->expr, &ctx);
 
-        /* 其他情况（如常量），直接拷贝 */
-        if (new_expr == NULL)
-            new_expr = (Node *) copyObject(expr);
-
-        /* 再次确保 pstrdup 安全 */
-        char *new_resname = (tle->resname != NULL) ? pstrdup(tle->resname) : NULL;
-
-        TargetEntry *new_tle = makeTargetEntry((Expr *) new_expr,
-                                               tle->resno,
-                                               new_resname,
-                                               tle->resjunk);
-
-        new_tle->ressortgroupref = tle->ressortgroupref;
-        out = lappend(out, new_tle);
+        out = lappend(out, ntle);
     }
+
     return out;
 }
+
 
 static Plan *
 vector_rrf_plan_custom_path(PlannerInfo *root,
@@ -839,22 +673,41 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
     cscan->custom_exprs = NIL;
     cscan->scan.scanrelid = rel->relid;
 
-    /* 1. 构建物理输出列 (custom_scan_tlist): 表列 + score */
+    /* 1) 构建物理输出列 (custom_scan_tlist): 表列 + score
+     *    这里会决定 score_resno（非常关键，后面替换 rrf() 要用）
+     */
     int score_resno = 0;
     cscan->custom_scan_tlist = build_custom_scan_tlist_for_table(root, rel, &score_resno);
 
-    /* 2. 构建逻辑输出列 (plan.targetlist)
-     * 直接映射 Query 的要求，不再需要 Result 节点。
-     * 这里的 Var 使用 INDEX_VAR，指向上面的 custom_scan_tlist。
-     */
-    cscan->scan.plan.targetlist = create_custom_scan_plan_tlist(tlist, score_resno, rel->relid);
+    /* 2) 初始化 ctx：必须在第一次用 &ctx 之前 */
+    ReplaceRrfPlanCtx ctx;
+    ctx.scanrelid   = rel->relid;
+    ctx.score_resno = score_resno;
 
-    /* 3. 处理 Quals */
+    /* 3) 处理 Quals：先从 clauses 填进 plan.qual，再做 rrf() -> score Var 替换 */
     cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
+
+    cscan->scan.plan.qual =
+        (List *) replace_rrf_with_score_var_plan_mutator((Node *) cscan->scan.plan.qual, &ctx);
+
+    /* 4) 构建逻辑输出列 (plan.targetlist)
+     *    你这里 create_custom_scan_plan_tlist() 里如果也可能包含 rrf()，
+     *    也可以在它返回后对 targetlist 再跑一遍 mutator（看你实现）
+     */
+    cscan->scan.plan.targetlist =
+        create_custom_scan_plan_tlist(tlist, score_resno, rel->relid);
+
+    /* ====== DEBUG：最粗暴打印 targetlist 全貌 ====== */
+    elog(WARNING, "DEBUG: targetlist nodeToString: %s",
+         nodeToString((Node *) cscan->scan.plan.targetlist));
+
+    elog(WARNING, "DEBUG: targetlist pprint begin");
+    pprint((Node *) cscan->scan.plan.targetlist);
+    elog(WARNING, "DEBUG: targetlist pprint end");
+    /* ============================================ */
 
     elog(WARNING, "DEBUG: PlanCustomPath finished (returning CustomScan directly).");
 
-    /* 直接返回 CustomScan，不再包裹 Result */
     return &cscan->scan.plan;
 }
 
