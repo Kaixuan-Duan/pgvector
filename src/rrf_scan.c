@@ -53,6 +53,11 @@ static List *rrf_func_oids = NIL;
 
 static bool rrf_func_oids_inited = false;
 
+/* * 全局上下文指针：用于在 CustomScan 执行器和 rrf() 函数之间传递分数。
+ * 因为 PG 是单进程模型，在同一个查询执行线程中，这是安全的。
+ */
+double *current_rrf_score = NULL;
+
 /* ---------------- Result structs ---------------- */
 
 typedef struct RRFResultItem
@@ -588,7 +593,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->path.param_info = NULL;
     cpath->path.rows = rel->rows;
 
-    /* 必须：否则 create_projection_path 会崩 */
+    /* 必须：否则 create_projection_path 会崩 ！！！！！！！！！！！！ */
     cpath->path.pathtarget = rel->reltarget;
 
     /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
@@ -987,6 +992,13 @@ vector_rrf_exec(CustomScanState *node)
         if (!ok)
             continue;
 
+
+        /* 1. 设置全局指针 (指向当前结果的 score) */
+        /* 注意：这个地址在 st->results 数组释放前都是有效的 */
+        current_rrf_score = &it->score;
+        /* Debug 日志: 证明我们设置了 */
+        elog(WARNING, "VectorRRF exec: set global ptr for cursor=%d score=%.6f", st->cursor, it->score);
+
         /* fill scanSlot = all heap cols + score (last) */
         ExecClearTuple(scanSlot);
 
@@ -1027,17 +1039,40 @@ vector_rrf_exec(CustomScanState *node)
                  ItemPointerGetOffsetNumber(&it->tid));
             continue;
         }
+        /* --- 修改开始 --- */
 
         /* projection: fill ps_ResultTupleSlot and return */
         if (node->ss.ps.ps_ProjInfo)
         {
+
+            /* 2. 执行投影。此时 ExecProject 会调用 SQL 中的 rrf() 函数 */
             TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
+
+            /* 3. 【用完即焚】调用完必须置空，防止污染其他调用 */
+            /* * [关键修正]：千万不要在这里 current_rrf_score = NULL;
+             * 因为 return out 之后，上层节点(Result Node) 还会立刻再次调用 rrf()！
+             */
+            /* Debug 日志 (可选) */
+            elog(WARNING, "VectorRRF exec: passed score %.6f via global ptr", it->score);
             elog(WARNING,
                  "VectorRRF exec: returned projected tuple for tid=%u/%u",
                  ItemPointerGetBlockNumber(&it->tid),
                  ItemPointerGetOffsetNumber(&it->tid));
+
             return out;
         }
+        /* --- 修改结束 --- */
+
+        /* projection: fill ps_ResultTupleSlot and return */
+        // if (node->ss.ps.ps_ProjInfo)
+        // {
+        //     TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
+        //     elog(WARNING,
+        //          "VectorRRF exec: returned projected tuple for tid=%u/%u",
+        //          ItemPointerGetBlockNumber(&it->tid),
+        //          ItemPointerGetOffsetNumber(&it->tid));
+        //     return out;
+        // }
 
         ExecCopySlot(resultSlot, scanSlot);
         elog(WARNING,
@@ -1046,6 +1081,9 @@ vector_rrf_exec(CustomScanState *node)
              ItemPointerGetOffsetNumber(&it->tid));
         return resultSlot;
     }
+    /* 3. 只有在扫描结束 (EOF) 时，才清空指针 */
+    // current_rrf_score = NULL;
+    // elog(WARNING, "VectorRRF exec: EOF, cleared global ptr");
 
     elog(WARNING, "VectorRRF exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
     return NULL;
@@ -1055,6 +1093,8 @@ vector_rrf_exec(CustomScanState *node)
 static void
 vector_rrf_end(CustomScanState *node)
 {
+    /* 安全清理 */
+    current_rrf_score = NULL;
     VectorRRFScanState *st = (VectorRRFScanState *) node;
 
     if (st->fetch)
