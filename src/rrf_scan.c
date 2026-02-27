@@ -640,7 +640,14 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand1_expr));
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand2_expr));
 
-    add_path(rel, &cpath->path);
+    // add_path(rel, &cpath->path);
+    #if PG_VERSION_NUM >= 160000
+        /* PG16+ */
+        add_path(rel, &cpath->path);
+    #else
+        /* PG14 / PG15 (Cloudberry 基于 PG14) */
+        add_path(rel, &cpath->path, root);
+    #endif
 }
 
 /* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
