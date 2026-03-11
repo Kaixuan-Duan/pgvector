@@ -177,7 +177,7 @@ load_rrf_func_oids(void)
 
     fname = list_make1(makeString("rrf"));
 
-#if PG_VERSION_NUM >= 170000
+
     /*
      * PG17: FuncnameGetCandidates() 多了一个参数（通常是 missing_ok）
      * 这里传 true：找不到也别报错，返回空即可
@@ -190,15 +190,7 @@ load_rrf_func_oids(void)
                                  false, /* include_out_arguments */
                                  true   /* missing_ok */
                                  );
-#else
-    clist = FuncnameGetCandidates(fname,
-                                 -1,    /* nargs */
-                                 NIL,   /* argnames */
-                                 false, /* expand_variadic */
-                                 false, /* expand_defaults */
-                                 false  /* include_out_arguments */
-                                 );
-#endif
+
 
     for (; clist != NULL; clist = clist->next)
         rrf_func_oids = lappend_oid(rrf_func_oids, clist->oid);
@@ -644,7 +636,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand1_expr));
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand2_expr));
 
-    add_path(rel, &cpath->path);
+    add_path(rel, &cpath->path,root);
 }
 
 /* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
@@ -1073,21 +1065,14 @@ vector_rrf_exec(CustomScanState *node)
             call_again = false;
             ExecClearTuple(st->heapSlot);
 
-#if PG_VERSION_NUM >= 160000
+
             ok = table_index_fetch_tuple(st->fetch,
                                          &it->tid,
                                          st->snapshot,
                                          st->heapSlot,
                                          &call_again,
                                          &all_dead);
-#else
-            /* older versions: signature may differ; keep for safety */
-            ok = table_index_fetch_tuple(st->fetch,
-                                         &it->tid,
-                                         st->snapshot,
-                                         st->heapSlot,
-                                         &call_again);
-#endif
+
         } while (call_again);
 
         elog(WARNING,
