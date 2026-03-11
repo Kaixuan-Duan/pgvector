@@ -19,6 +19,8 @@
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "vector.h"
+// 添加cdb库
+#include "cdb/cdbvars.h"
 
 #if PG_VERSION_NUM >= 140000
 #include "utils/backend_progress.h"
@@ -420,7 +422,7 @@ ComputeCenters(IvfflatBuildState * buildstate)
 	/* Sample rows */
 	/* TODO Ensure within maintenance_work_mem */
 	buildstate->samples = VectorArrayInit(numSamples, buildstate->dimensions, buildstate->centers->itemsize);
-	if (buildstate->heap != NULL)
+	if (buildstate->heap != NULL && Gp_role != GP_ROLE_DISPATCH)
 	{
 		SampleRows(buildstate);
 

@@ -660,9 +660,26 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
     CustomScan *cscan = makeNode(CustomScan);
 
     cscan->methods = &vector_rrf_scan_methods;
-    cscan->custom_private = best_path->custom_private;
+    cscan->custom_private = NIL;
     cscan->custom_plans = NIL;
     cscan->custom_exprs = NIL;
+
+    ListCell *lc;
+    int i = 0;
+    foreach(lc, best_path->custom_private)
+    {
+        if (i < 3)
+        {
+            /* 前 3 个是普通数值 (indexoid, col1, col2)，放入 custom_private */
+            cscan->custom_private = lappend(cscan->custom_private, lfirst(lc));
+        }
+        else
+        {
+            /* 第 3 个开始全是表达式 (limit, op1, op2, q1, q2 等)，必须放入 custom_exprs */
+            cscan->custom_exprs = lappend(cscan->custom_exprs, lfirst(lc));
+        }
+        i++;
+    }
 
     cscan->scan.scanrelid = rel->relid;
 
@@ -963,17 +980,19 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
 
     st->indexRel = index_open(indexoid, AccessShareLock);
 
-    /* expr nodes from custom_private */
-    Expr *limit_expr = (Expr *) list_nth(priv, 3);
-    Expr *op1_expr    = (Expr *) list_nth(priv, 4);
-    Expr *op2_expr    = (Expr *) list_nth(priv, 5);
-    Expr *q1_expr     = (Expr *) list_nth(priv, 6);
-    Expr *q2_expr     = (Expr *) list_nth(priv, 7);
-    Expr *k_expr      = (Expr *) list_nth(priv, 8);
-    Expr *w1_expr     = (Expr *) list_nth(priv, 9);
-    Expr *w2_expr     = (Expr *) list_nth(priv, 10);
-    Expr *cand1_expr  = (Expr *) list_nth(priv, 11);
-    Expr *cand2_expr  = (Expr *) list_nth(priv, 12);
+    /* --- 修改开始：从 custom_exprs 读取所有的表达式 --- */
+    List *exprs = cscan->custom_exprs;
+
+    Expr *limit_expr  = (Expr *) list_nth(exprs, 0);
+    Expr *op1_expr    = (Expr *) list_nth(exprs, 1);
+    Expr *op2_expr    = (Expr *) list_nth(exprs, 2);
+    Expr *q1_expr     = (Expr *) list_nth(exprs, 3);
+    Expr *q2_expr     = (Expr *) list_nth(exprs, 4);
+    Expr *k_expr      = (Expr *) list_nth(exprs, 5);
+    Expr *w1_expr     = (Expr *) list_nth(exprs, 6);
+    Expr *w2_expr     = (Expr *) list_nth(exprs, 7);
+    Expr *cand1_expr  = (Expr *) list_nth(exprs, 8);
+    Expr *cand2_expr  = (Expr *) list_nth(exprs, 9);
 
     st->limit_state = ExecInitExpr(limit_expr, (PlanState *) node);
     st->op1_state   = ExecInitExpr(op1_expr, (PlanState *) node);
