@@ -592,6 +592,31 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     /* 必须：否则 create_projection_path 会崩 ！！！！！！！！！！！！ */
     cpath->path.pathtarget = rel->reltarget;
 
+    /* * 【新增修复】：Cloudberry/GPDB MPP 架构必须配置数据的分布特征 (Locus)。
+     * 我们直接从系统已经生成的原生路径（比如 SeqScan）里“抄”一个过来。
+     */
+    /* 【终极修复与调试：处理 Locus 分布特征】 */
+    elog(NOTICE, "[VectorRRF] 准备分配 locus. 当前 rel->pathlist 长度: %d", list_length(rel->pathlist));
+
+    if (rel->pathlist != NIL)
+    {
+        Path *existing_path = (Path *) linitial(rel->pathlist);
+        cpath->path.locus = existing_path->locus;
+    }else
+    {
+        /* 如果真的见鬼了，基础路径为空，抛出明确错误阻断它 */
+        elog(ERROR, "[VectorRRF] 灾难：rel->pathlist 是空的，无法抄作业！");
+    }
+
+    /* 检查是否依然为空 (0 通常代表 CdbLocusType_Null) */
+    if (cpath->path.locus.locustype == 0)
+    {
+        elog(ERROR, "[VectorRRF] 抄来的 locus 竟然也是空的！");
+    }
+
+    /* 将装配完整的路径提交给调度中心 */
+    elog(NOTICE, "[VectorRRF] Locus 检查完毕，正式调用 add_path...");
+
     /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
     cpath->path.startup_cost = 0;
     cpath->path.total_cost = 1;
@@ -770,101 +795,14 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     /* topK arrays */
     HnswTopKItem *list1 = palloc0(sizeof(HnswTopKItem) * st->cand1);
     // list2会先使用DSM共享内存,如果并行失败则使用本地内存
-    HnswTopKItem *list2 = NULL;
+    HnswTopKItem *list2 = palloc0(size0of(HnswTopKItem) * st->cand2);
     int n1 = 0, n2 = 0;
 
-    /* --- 并行执行准备 --- */
-    ParallelContext *pcxt = NULL;
-    RrfSharedState  *shared_state = NULL;
-    Size             q2_size = VARSIZE_ANY(DatumGetPointer(q2)); /* 获取向量的实际字节大小 */
-    Size             list2_size = sizeof(HnswTopKItem) * st->cand2;
-
-
-    EnterParallelMode();
-
-    /* * 参数 1："vector" 是你的插件/库的名称 (根据你的 Makefile/extension 确定)。
-     * 参数 2：我们在 rrf_parallel.c 里定义的 Worker 入口函数。
-     * 参数 3：请求 1 个 Worker 进程。
-     */
-    pcxt = CreateParallelContext("hybrid_vector","RrfParallelWorkerMain",1);
-
-
-    /* 估算共享内存大小 */
-    shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RrfSharedState));
-    shm_toc_estimate_chunk(&pcxt->estimator, q2_size);
-    shm_toc_estimate_chunk(&pcxt->estimator, list2_size);
-    shm_toc_estimate_keys(&pcxt->estimator, 3);
-
-    //初始化DSM
-    InitializeParallelDSM(pcxt);
-    elog(WARNING, "完成DSM初始化");
-    if (pcxt->seg != NULL)
-    {
-        /* 分配共享内存块 */
-        shared_state = shm_toc_allocate(pcxt->toc, sizeof(RrfSharedState));
-        Pointer q2_shared = shm_toc_allocate(pcxt->toc, q2_size);
-        list2 = shm_toc_allocate(pcxt->toc, list2_size);
-
-        /* 填充元数据 */
-        shared_state->heap_oid  = RelationGetRelid(st->heapRel);
-        shared_state->index_oid = RelationGetRelid(st->indexRel);
-        shared_state->col2      = st->col2;
-        shared_state->op2       = st->op2;
-        shared_state->cand2     = st->cand2;
-        shared_state->n2_result = 0;
-
-        /* 将 q2 向量的字节拷贝进共享内存 */
-        memcpy(q2_shared, DatumGetPointer(q2), q2_size);
-
-        /* 注册 Key */
-        shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_SHARED, shared_state);
-        shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_Q2, q2_shared);
-        shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_LIST2, list2);
-
-        /* 正式启动 Worker！ */
-        LaunchParallelWorkers(pcxt);
-    }
-    /* --- 主进程执行 Col 1 --- */
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col1, st->op1, q1, st->cand1, list1, &n1);
-
-    /* --- 处理 Col 2 的结果 --- */
-    if (pcxt->seg != NULL && pcxt->nworkers_launched > 0)
-    {
-        /* * 成功拉起了 Worker：主进程挂起，等待 Worker 算完 col2
-         */
-        elog(WARNING,"开始等待");
-        WaitForParallelWorkersToFinish(pcxt);
-        n2 = shared_state->n2_result;
-
-        /* 🚨 救命操作：在销毁 DSM 之前，把 Worker 算好的 list2 拷贝回本地内存！ 🚨 */
-        HnswTopKItem *local_list2 = palloc0(list2_size);
-        memcpy(local_list2, list2, list2_size);
-        /* 让后续逻辑使用我们本地的安全数组 */
-        list2 = local_list2;
-
-        elog(WARNING, "VectorRRF Parallel: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
-             st->op1, st->op2, st->cand1, st->cand2, n1, n2);
-    }else{
-        /* * 降级处理 (Fallback)：如果没有可用系统资源拉起 Worker，
-         * 我们退回到原来的串行模式，由主进程自己亲自算 col2。
-         */
-        elog(WARNING, "VectorRRF: Failed to launch parallel worker, falling back to serial execution");
-
-        /* 如果 DSM 分配失败，给 list2 分配本地内存 */
-        if (list2 == NULL) {
-            list2 = palloc0(list2_size);
-        }
-
-        HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2, st->cand2, list2, &n2);
-    }
-    /* 销毁并行上下文并退出并行模式 */
-    DestroyParallelContext(pcxt);
-    ExitParallelMode();
+    HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2, st->cand2, list2, &n2);
 
     elog(WARNING, "VectorRRF: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
      st->op1, st->op2, st->cand1, st->cand2, n1, n2);
-
-
 
     /* merge by tid */
     HASHCTL ctl;
