@@ -298,6 +298,22 @@ tid_to_key(const ItemPointer tid)
            (uint64) ItemPointerGetOffsetNumber(tid);
 }
 
+
+/* 新增：用于双指针合并前，将结果按 TID 物理地址排序 */
+static int
+cmp_rrf_item_by_tid(const void *a, const void *b)
+{
+    const RRFResultItem *x = (const RRFResultItem *) a;
+    const RRFResultItem *y = (const RRFResultItem *) b;
+    uint64 kx = tid_to_key(&x->tid);
+    uint64 ky = tid_to_key(&y->tid);
+
+    if (kx < ky) return -1;
+    if (kx > ky) return  1;
+    return 0;
+}
+
+
 static int
 cmp_rrf_item_desc(const void *a, const void *b)
 {
@@ -795,85 +811,159 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     /* topK arrays */
     HnswTopKItem *list1 = palloc0(sizeof(HnswTopKItem) * st->cand1);
     // list2会先使用DSM共享内存,如果并行失败则使用本地内存
-    HnswTopKItem *list2 = palloc0(size0of(HnswTopKItem) * st->cand2);
+    HnswTopKItem *list2 = palloc0(sizeof(HnswTopKItem) * st->cand2);
     int n1 = 0, n2 = 0;
 
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col1, st->op1, q1, st->cand1, list1, &n1);
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2, st->cand2, list2, &n2);
 
-    elog(WARNING, "VectorRRF: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
+    elog(WARNING, "VectorLinear: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
      st->op1, st->op2, st->cand1, st->cand2, n1, n2);
 
-    /* merge by tid */
-    HASHCTL ctl;
-    memset(&ctl, 0, sizeof(ctl));
-    ctl.keysize = sizeof(uint64);
-    ctl.entrysize = sizeof(RRFHashEntry);
-    // HTAB *ht = hash_create("rrf_hash", n1 + n2, &ctl, HASH_ELEM);
-    HTAB *ht = hash_create("rrf_hash", Max(n1 + n2, 16), &ctl, HASH_ELEM | HASH_BLOBS);
+    /* ================= 极速双指针合并与归一化打分重构 ================= */
 
+    /* 1. 转存数据以保留名次 (Rank)，同时在一次遍历中求出局部极值 */
+    RRFResultItem *arr1 = palloc0(sizeof(RRFResultItem) * n1);
+    float8 min_d1 = 0.0, max_d1 = 0.0;
+    if (n1 > 0) {
+        min_d1 = max_d1 = list1[0].distance;
+        for (int i = 0; i < n1; i++) {
+            arr1[i].tid = list1[i].tid;
+            arr1[i].d1  = list1[i].distance;
+            arr1[i].r1  = i + 1; /* 记录原始排名 */
 
-    /* 路1 */
-    for (int i = 0; i < n1; i++)
-    {
-        uint64 key = tid_to_key(&list1[i].tid);
-        bool found;
-        RRFHashEntry *e = hash_search(ht, &key, HASH_ENTER, &found);
-        if (!found)
-        {
-            e->key = key;
-            e->tid = list1[i].tid;
-            e->r1 = e->r2 = 0;
-            e->d1 = e->d2 = 0;
-            e->score = 0;
+            if (list1[i].distance < min_d1) min_d1 = list1[i].distance;
+            if (list1[i].distance > max_d1) max_d1 = list1[i].distance;
         }
-        e->r1 = i + 1;
-        e->d1 = list1[i].distance;
-        e->score += st->w1 / (st->k + (float8)(i + 1));
     }
 
-    /* 路2 */
-    for (int i = 0; i < n2; i++)
-    {
-        uint64 key = tid_to_key(&list2[i].tid);
-        bool found;
-        RRFHashEntry *e = hash_search(ht, &key, HASH_ENTER, &found);
-        if (!found)
-        {
-            e->key = key;
-            e->tid = list2[i].tid;
-            e->r1 = e->r2 = 0;
-            e->d1 = e->d2 = 0;
-            e->score = 0;
+    RRFResultItem *arr2 = palloc0(sizeof(RRFResultItem) * n2);
+    float8 min_d2 = 0.0, max_d2 = 0.0;
+    if (n2 > 0) {
+        min_d2 = max_d2 = list2[0].distance;
+        for (int i = 0; i < n2; i++) {
+            arr2[i].tid = list2[i].tid;
+            arr2[i].d2  = list2[i].distance;
+            arr2[i].r2  = i + 1; /* 记录原始排名 */
+
+            if (list2[i].distance < min_d2) min_d2 = list2[i].distance;
+            if (list2[i].distance > max_d2) max_d2 = list2[i].distance;
         }
-        e->r2 = i + 1;
-        e->d2 = list2[i].distance;
-        e->score += st->w2 / (st->k + (float8)(i + 1));
     }
 
-    /* 5) hash → array */
-    int cap = hash_get_num_entries(ht);
-    RRFResultItem *arr = palloc0(sizeof(RRFResultItem) * cap);
+    /* 2. 对两路结果按 TID 进行升序排序（C 语言原生 qsort 极快） */
+    if (n1 > 0) qsort(arr1, n1, sizeof(RRFResultItem), cmp_rrf_item_by_tid);
+    if (n2 > 0) qsort(arr2, n2, sizeof(RRFResultItem), cmp_rrf_item_by_tid);
 
-    HASH_SEQ_STATUS seq;
-    hash_seq_init(&seq, ht);
+    /* 3. 使用 O(N) 的双指针 (Sort-Merge Join) 替代沉重的哈希表合并 */
+    RRFResultItem *arr = palloc0(sizeof(RRFResultItem) * (n1 + n2));
+    int n = 0, p1 = 0, p2 = 0;
 
-    int n = 0;
-    for (;;)
-    {
-        RRFHashEntry *e = (RRFHashEntry *) hash_seq_search(&seq);
-        if (!e) break;
+    while (p1 < n1 && p2 < n2) {
+        uint64 k1 = tid_to_key(&arr1[p1].tid);
+        uint64 k2 = tid_to_key(&arr2[p2].tid);
 
-        arr[n].tid = e->tid;
-        arr[n].score = e->score;
-        arr[n].r1 = e->r1;
-        arr[n].r2 = e->r2;
-        arr[n].d1 = e->d1;
-        arr[n].d2 = e->d2;
+        if (k1 == k2) {
+            /* 两路都命中了这条数据 */
+            arr[n].tid = arr1[p1].tid;
+            arr[n].r1  = arr1[p1].r1;
+            arr[n].r2  = arr2[p2].r2;
+            arr[n].d1  = arr1[p1].d1;
+            arr[n].d2  = arr2[p2].d2;
+            p1++;
+            p2++;
+        } else if (k1 < k2) {
+            /* 仅在路 1 命中 */
+            arr[n] = arr1[p1];
+            arr[n].r2 = 0; /* 标记路 2 未命中 */
+            p1++;
+        } else {
+            /* 仅在路 2 命中 */
+            arr[n] = arr2[p2];
+            arr[n].r1 = 0; /* 标记路 1 未命中 */
+            p2++;
+        }
         n++;
     }
 
-    /* 6) sort + 截断 top LIMIT */
+    /* 将剩余未合并完的尾部数据追加进去 */
+    while (p1 < n1) {
+        arr[n] = arr1[p1];
+        arr[n].r2 = 0;
+        p1++; n++;
+    }
+    while (p2 < n2) {
+        arr[n] = arr2[p2];
+        arr[n].r1 = 0;
+        p2++; n++;
+    }
+
+/* ---------------- 新增：在循环外判定 第二路(稠密 emb2) 的操作符类型 ---------------- */
+    /* 注意：现在 op2 才是稠密向量的操作符！ */
+    char *opname2 = get_opname(st->op2);
+    int metric_type2 = 0; /* 默认 0: 余弦/L2 [0, 2]， 1: 内积 [-1, 1] */
+
+    if (opname2 != NULL) {
+        if (strcmp(opname2, "<#>") == 0) {
+            metric_type2 = 1;
+        } else if (strcmp(opname2, "<=>") == 0 || strcmp(opname2, "<->") == 0) {
+            metric_type2 = 0;
+        } else {
+            elog(WARNING, "VectorLinear: Unknown operator '%s', defaulting to Cosine/L2", opname2);
+        }
+        pfree(opname2);
+    }
+
+    /* 只对 第一路(稀疏 emb1) 计算局部极值倒数 & 保护系数 */
+    const float8 EPSILON = 1e-6;
+    float8 range1 = (max_d1 - min_d1) + EPSILON;
+    float8 inv_range1 = 1.0 / range1;
+
+    float8 w1 = st->w1;
+    float8 w2 = st->w2;
+
+    /* Tight Loop 纯算术运算 */
+    for (int i = 0; i < n; i++) {
+        float8 score_d1 = 0.0;
+        float8 score_d2 = 0.0;
+
+        /* ---------------- 第一路：稀疏 (Sparse,对应 emb1) ----------------
+         * 稀疏分数无绝对上限，使用局部 Min-Max + EPSILON
+         */
+        if (arr[i].r1 > 0) {
+            score_d1 = (max_d1 - arr[i].d1) * inv_range1;
+            /* 防御性兜底 */
+            if (score_d1 < 0.0) score_d1 = 0.0;
+            if (score_d1 > 1.0) score_d1 = 1.0;
+        } else {
+            score_d1 = 0.0; /* 未命中的绝对最低分 */
+        }
+
+        /* ---------------- 第二路：稠密 (Dense,对应 emb2) ---------------- */
+        if (arr[i].r2 > 0) {
+            if (metric_type2 == 1) {
+                /* 内积 <#>：pgvector 返回负内积，范围 [-1, 1]，-1 最完美 */
+                score_d2 = (1.0 - arr[i].d2) / 2.0;
+            } else {
+                /* 余弦 <=> / L2 <->：范围 [0, 2]，0 最完美 */
+                score_d2 = 1.0 - (arr[i].d2 / 2.0);
+            }
+
+            /* 防御性兜底 */
+            if (score_d2 < 0.0) score_d2 = 0.0;
+            if (score_d2 > 1.0) score_d2 = 1.0;
+        } else {
+            score_d2 = 0.0; /* 未命中的绝对最低分 */
+        }
+
+        /* ---------------- 最终融合打分 ---------------- */
+        arr[i].score = (w1 * score_d1) + (w2 * score_d2);
+    }
+    /* 不再需要 arr1 和 arr2，可以由 MemoryContext 自动清理，也可以手动释放 */
+    pfree(arr1);
+    pfree(arr2);
+
+    /* 5. 对最终得分进行排序 + 截断 top LIMIT (保留你原有的逻辑) */
     qsort(arr, n, sizeof(RRFResultItem), cmp_rrf_item_desc);
 
     if (st->limit > 0 && n > st->limit)
@@ -882,7 +972,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     st->results = arr;
     st->nresults = n;
     st->cursor = 0;
-    elog(WARNING, "VectorRRF: st->nresults=%d", n);
+    elog(WARNING, "VectorLinear: st->nresults=%d (Merged with Two-Pointers)", n);
 
     MemoryContextSwitchTo(old);
 }
