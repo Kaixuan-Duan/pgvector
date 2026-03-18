@@ -788,7 +788,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
 
     //初始化DSM
     InitializeParallelDSM(pcxt);
-    elog(WARNING, "完成DSM初始化");
+    //elog(WARNING, "完成DSM初始化");
     if (pcxt->seg != NULL)
     {
         /* 分配共享内存块 */
@@ -823,7 +823,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     {
         /* * 成功拉起了 Worker：主进程挂起，等待 Worker 算完 col2
          */
-        elog(WARNING,"开始等待");
+        //elog(WARNING,"开始等待");
         WaitForParallelWorkersToFinish(pcxt);
         n2 = shared_state->n2_result;
 
@@ -833,13 +833,13 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         /* 让后续逻辑使用我们本地的安全数组 */
         list2 = local_list2;
 
-        elog(WARNING, "VectorRRF Parallel: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
-             st->op1, st->op2, st->cand1, st->cand2, n1, n2);
+        //elog(WARNING, "VectorRRF Parallel: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
+        //     st->op1, st->op2, st->cand1, st->cand2, n1, n2);
     }else{
         /* * 降级处理 (Fallback)：如果没有可用系统资源拉起 Worker，
          * 我们退回到原来的串行模式，由主进程自己亲自算 col2。
          */
-        elog(WARNING, "VectorRRF: Failed to launch parallel worker, falling back to serial execution");
+        //elog(WARNING, "VectorRRF: Failed to launch parallel worker, falling back to serial execution");
 
         /* 如果 DSM 分配失败，给 list2 分配本地内存 */
         if (list2 == NULL) {
@@ -852,8 +852,8 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     DestroyParallelContext(pcxt);
     ExitParallelMode();
 
-    elog(WARNING, "VectorRRF: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
-     st->op1, st->op2, st->cand1, st->cand2, n1, n2);
+    //elog(WARNING, "VectorRRF: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
+     // st->op1, st->op2, st->cand1, st->cand2, n1, n2);
 
 
 
@@ -935,7 +935,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     st->results = arr;
     st->nresults = n;
     st->cursor = 0;
-    elog(WARNING, "VectorRRF: st->nresults=%d", n);
+    //elog(WARNING, "VectorRRF: st->nresults=%d", n);
 
     MemoryContextSwitchTo(old);
 }
@@ -1025,18 +1025,18 @@ vector_rrf_exec(CustomScanState *node)
         /* --- DEBUG: cursor / tid / score --- */
         if (!ItemPointerIsValid(&it->tid))
         {
-            elog(WARNING,
-                 "VectorRRF exec: invalid TID at cursor=%d/%d (score=%.6f)",
-                 cur, st->nresults, it->score);
+            // elog(WARNING,
+            //      "VectorRRF exec: invalid TID at cursor=%d/%d (score=%.6f)",
+            //      cur, st->nresults, it->score);
             continue;
         }
 
-        elog(WARNING,
-             "VectorRRF exec: cursor=%d/%d tid=%u/%u score=%.6f",
-             cur, st->nresults,
-             ItemPointerGetBlockNumber(&it->tid),
-             ItemPointerGetOffsetNumber(&it->tid),
-             it->score);
+        // elog(WARNING,
+        //      "VectorRRF exec: cursor=%d/%d tid=%u/%u score=%.6f",
+        //      cur, st->nresults,
+        //      ItemPointerGetBlockNumber(&it->tid),
+        //      ItemPointerGetOffsetNumber(&it->tid),
+        //      it->score);
 
         ExecClearTuple(st->heapSlot);
 
@@ -1086,7 +1086,7 @@ vector_rrf_exec(CustomScanState *node)
         /* 注意：这个地址在 st->results 数组释放前都是有效的 */
         current_rrf_score = &it->score;
         /* Debug 日志: 证明我们设置了 */
-        elog(WARNING, "VectorRRF exec: set global ptr for cursor=%d score=%.6f", st->cursor, it->score);
+       // elog(WARNING, "VectorRRF exec: set global ptr for cursor=%d score=%.6f", st->cursor, it->score);
 
         /* fill scanSlot = all heap cols + score (last) */
         ExecClearTuple(scanSlot);
@@ -1097,9 +1097,9 @@ vector_rrf_exec(CustomScanState *node)
         int natts_heap = st->heapSlot->tts_tupleDescriptor->natts;
         int natts_scan = scanSlot->tts_tupleDescriptor->natts;
 
-        elog(WARNING,
-             "VectorRRF exec: natts_heap=%d natts_scan=%d (expect scan=heap+1)",
-             natts_heap, natts_scan);
+        // elog(WARNING,
+        //      "VectorRRF exec: natts_heap=%d natts_scan=%d (expect scan=heap+1)",
+        //      natts_heap, natts_scan);
 
         /* expect scan = heap + 1 */
         if (natts_scan != natts_heap + 1)
@@ -1122,10 +1122,10 @@ vector_rrf_exec(CustomScanState *node)
         econtext->ecxt_scantuple = scanSlot;
         if (node->ss.ps.qual && !ExecQual(node->ss.ps.qual, econtext))
         {
-            elog(WARNING,
-                 "VectorRRF exec: qual filtered tid=%u/%u",
-                 ItemPointerGetBlockNumber(&it->tid),
-                 ItemPointerGetOffsetNumber(&it->tid));
+            // elog(WARNING,
+            //      "VectorRRF exec: qual filtered tid=%u/%u",
+            //      ItemPointerGetBlockNumber(&it->tid),
+            //      ItemPointerGetOffsetNumber(&it->tid));
             continue;
         }
         /* --- 修改开始 --- */
@@ -1142,11 +1142,11 @@ vector_rrf_exec(CustomScanState *node)
              * 因为 return out 之后，上层节点(Result Node) 还会立刻再次调用 rrf()！
              */
             /* Debug 日志 (可选) */
-            elog(WARNING, "VectorRRF exec: passed score %.6f via global ptr", it->score);
-            elog(WARNING,
-                 "VectorRRF exec: returned projected tuple for tid=%u/%u",
-                 ItemPointerGetBlockNumber(&it->tid),
-                 ItemPointerGetOffsetNumber(&it->tid));
+            // elog(WARNING, "VectorRRF exec: passed score %.6f via global ptr", it->score);
+            // elog(WARNING,
+            //      "VectorRRF exec: returned projected tuple for tid=%u/%u",
+            //      ItemPointerGetBlockNumber(&it->tid),
+            //      ItemPointerGetOffsetNumber(&it->tid));
 
             return out;
         }
@@ -1164,17 +1164,17 @@ vector_rrf_exec(CustomScanState *node)
         // }
 
         ExecCopySlot(resultSlot, scanSlot);
-        elog(WARNING,
-             "VectorRRF exec: returned tuple (no projection) for tid=%u/%u",
-             ItemPointerGetBlockNumber(&it->tid),
-             ItemPointerGetOffsetNumber(&it->tid));
+        // elog(WARNING,
+        //      "VectorRRF exec: returned tuple (no projection) for tid=%u/%u",
+        //      ItemPointerGetBlockNumber(&it->tid),
+        //      ItemPointerGetOffsetNumber(&it->tid));
         return resultSlot;
     }
     /* 3. 只有在扫描结束 (EOF) 时，才清空指针 */
     // current_rrf_score = NULL;
     // elog(WARNING, "VectorRRF exec: EOF, cleared global ptr");
 
-    elog(WARNING, "VectorRRF exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
+    //elog(WARNING, "VectorRRF exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
     return NULL;
 }
 

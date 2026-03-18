@@ -31,7 +31,7 @@ RrfParallelWorkerMain(dsm_segment *seg, shm_toc *toc)
     shared_state = shm_toc_lookup(toc, PARALLEL_KEY_RRF_SHARED, false);
     q2_ptr       = shm_toc_lookup(toc, PARALLEL_KEY_RRF_Q2, false);
     list2_shared = shm_toc_lookup(toc, PARALLEL_KEY_RRF_LIST2, false);
-    elog(WARNING, "worker取参数成功");
+    //elog(WARNING, "worker取参数成功");
 
     /* 构造 Datum：直接指向 DSM 中的变长数组 (varlena) */
     q2_datum = PointerGetDatum(q2_ptr);
@@ -39,13 +39,13 @@ RrfParallelWorkerMain(dsm_segment *seg, shm_toc *toc)
     /* 2. 打开表和索引（获取与主进程相同的锁） */
     heapRel  = table_open(shared_state->heap_oid, AccessShareLock);
     indexRel = index_open(shared_state->index_oid, AccessShareLock);
-    elog(WARNING, "worker打开表和索引成功");
+    //elog(WARNING, "worker打开表和索引成功");
 
     /* * 3. 执行核心搜索逻辑
      * 注意：Parallel Worker 会自动继承并设置主进程的 ActiveSnapshot，
      * 所以 HnswTopKForColumn 内部调用的 GetActiveSnapshot() 会正常工作。
      */
-    elog(WARNING, "work执行Topk逻辑");
+    //elog(WARNING, "work执行Topk逻辑");
     HnswTopKForColumn(heapRel,
                       indexRel,
                       shared_state->col2,
