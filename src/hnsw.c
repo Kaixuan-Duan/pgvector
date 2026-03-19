@@ -292,7 +292,6 @@ hnswcostestimatemulti(PlannerInfo *root, IndexPath *path, double loop_count,
 
     index_close(index, NoLock);
 
-    /* ---- 原版 HNSW 成本模型：完全复用 ---- */
     if (path->indexinfo->tuples > 0)
     {
         double  scalingFactor = 0.55;
@@ -366,7 +365,6 @@ hnswoptions(Datum reloptions, bool validate)
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
 
-		// todo dkx
 		{"m1", RELOPT_TYPE_INT, offsetof(HnswOptions, m1)},
 		{"ef_construction1", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction1)},
 		{"m2", RELOPT_TYPE_INT, offsetof(HnswOptions, m2)},
@@ -383,7 +381,7 @@ hnswoptions(Datum reloptions, bool validate)
 
 	if (new_used)
 	{
-		/* 4 参数模式：要求四个都给齐 */
+
 		if (opts->m1 <= 0 || opts->efConstruction1 <= 0 ||
 			opts->m2 <= 0 || opts->efConstruction2 <= 0)
 		{
@@ -392,11 +390,9 @@ hnswoptions(Datum reloptions, bool validate)
 					 errmsg("hydex HNSW options: when using m1/ef_construction1/m2/ef_construction2, all four must be > 0")));
 		}
 
-		/* 这里通常选择：忽略 legacy m/efConstruction（保持兼容），或者你也可以在 validate 时更严格 */
 	}
 	else
 	{
-		/* 2 参数模式（旧逻辑）：把旧参数复制到两套上，后续统一用 m1/ef1/m2/ef2 */
 		opts->m1 = opts->m;
 		opts->efConstruction1 = opts->efConstruction;
 		opts->m2 = opts->m;
@@ -404,18 +400,12 @@ hnswoptions(Datum reloptions, bool validate)
 	}
 
 	return (bytea *) opts;
-	// todo dkx
 
 
-	// return (bytea *) build_reloptions(reloptions, validate,
-	// 								  hnsw_relopt_kind,
-	// 								  sizeof(HnswOptions),
-	// 								  tab, lengthof(tab));
+
 }
 
-/*
- * Validate catalog entries for the specified operator class
- */
+
 static bool
 hnswvalidate(Oid opclassoid)
 {
@@ -438,9 +428,9 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->amoptsprocnum = 0;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = true;
-	amroutine->amcanbackward = false;	/* can change direction mid-scan */
+	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = true;	// todo dkx
+	amroutine->amcanmulticol = true;
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;
@@ -460,31 +450,29 @@ hnswhandler(PG_FUNCTION_ARGS)
 	amroutine->amkeytype = InvalidOid;
 
 	/* Interface functions */
-	amroutine->ambuild = hnswbuild_dispatch;	//hnswbuild;				// todo dkx ok
-	amroutine->ambuildempty = hnswbuildempty_dispatch; //hnswbuildempty;	// todo dkx ok
-	amroutine->aminsert = hnswinsert_dispatch;  //hnswinsert;				// todo dkx ok
+	amroutine->ambuild = hnswbuild_dispatch;	//hnswbuild;
+	amroutine->ambuildempty = hnswbuildempty_dispatch; //hnswbuildempty;
+	amroutine->aminsert = hnswinsert_dispatch;  //hnswinsert;
 #if PG_VERSION_NUM >= 170000
 	amroutine->aminsertcleanup = NULL;
 #endif
-	amroutine->ambulkdelete = hnswbulkdelete_dispatch;   //hnswbulkdelete;	// todo dkx ok
-	amroutine->amvacuumcleanup = hnswvacuumcleanup_dispatch;				// todo dkx ok
+	amroutine->ambulkdelete = hnswbulkdelete_dispatch;   //hnswbulkdelete;
+	amroutine->amvacuumcleanup = hnswvacuumcleanup_dispatch;
 	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = hnswcostestimate_dispatch;					// todo dkx ok
-	amroutine->amoptions = hnswoptions;										// todo dkx ok
-	amroutine->amproperty = NULL;	/* TODO AMPROP_DISTANCE_ORDERABLE */
+	amroutine->amcostestimate = hnswcostestimate_dispatch;
+	amroutine->amoptions = hnswoptions;
+	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = hnswbuildphasename;
-	amroutine->amvalidate = hnswvalidate;									// todo dkx ok
+	amroutine->amvalidate = hnswvalidate;
 #if PG_VERSION_NUM >= 140000
 	amroutine->amadjustmembers = NULL;
 #endif
-	/*
-	 *你之前的崩溃（enable_seqscan=off 后 server crash）主要还是 scan/gettuple/读取 metapage/graph 布局的问题
-	 */
-	amroutine->ambeginscan = hnswbeginscan_dispatch;						// todo dkx ok
-	amroutine->amrescan = hnswrescan_dispatch;								// todo dkx ok
-	amroutine->amgettuple = hnswgettuple_dispatch;							// todo dkx ok
+
+	amroutine->ambeginscan = hnswbeginscan_dispatch;
+	amroutine->amrescan = hnswrescan_dispatch;
+	amroutine->amgettuple = hnswgettuple_dispatch;
 	amroutine->amgetbitmap = NULL;
-	amroutine->amendscan = hnswendscan_dispatch;							// todo dkx ok
+	amroutine->amendscan = hnswendscan_dispatch;
 	amroutine->ammarkpos = NULL;
 	amroutine->amrestrpos = NULL;
 

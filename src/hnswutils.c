@@ -121,13 +121,12 @@ HnswGetMColumn(Relation index, int col)
 
 	if (opts)
 	{
-		/* === 两列最小支持：如果你已经在 HnswOptions 里加了 m1/m2 === */
-		/* 注：字段名以你实际为准；没加这些字段就删掉这段分支 */
+
 
 		if (col == 0 && opts->m1 > 0) return opts->m1;
 		if (col == 1 && opts->m2 > 0) return opts->m2;
 
-		/* 其它列先回退到默认 m（你未来扩展 N 列再改） */
+
 		return opts->m;
 	}
 
@@ -182,16 +181,14 @@ HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum)
 {
 	AttrNumber attno = (AttrNumber) (col + 1); /* 1-based */
 
-	/* 先确认该 support proc 是否存在 */
+
 	if (!OidIsValid(index_getprocid(index, attno, procnum)))
 		return NULL;
 
 	return index_getprocinfo(index, attno, procnum);
 }
 
-/*
- * Init support functions
- */
+
 void
 HnswInitSupport(HnswSupport * support, Relation index)
 {
@@ -210,9 +207,7 @@ HnswInitSupportColumn(HnswSupport *support, Relation index, int col)
 	support->normprocinfo = HnswOptionalProcInfoColumn(index, col, HNSW_NORM_PROC);
 }
 
-/*
- * Normalize value
- */
+
 Datum
 HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value)
 {
@@ -385,13 +380,13 @@ HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoin
 {
 	Buffer      buf;
 	Page        page;
-	HnswMetaPage metap; /* 先用旧结构读头 */
+	HnswMetaPage metap;
 
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
-	metap = HnswPageGetMeta(page); /* 先用旧结构读头 */
+	metap = HnswPageGetMeta(page);
 
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
@@ -455,14 +450,12 @@ HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoin
 		return;
 	}
 
-	/* 未知版本 */
+
 	elog(ERROR, "hnsw metapage has unknown version: %u", metap->version);
 }
 
 
-/*
- * Get the entry point
- */
+
 HnswElement
 HnswGetEntryPoint(Relation index)
 {
@@ -478,11 +471,10 @@ HnswGetEntryPointColumn(Relation index, int col)
 {
 	HnswElement entryPoint;
 
-	/* 旧布局兼容：单列索引仍然走原版 */
+
 	if (col == 0 && IndexRelationGetNumberOfKeyAttributes(index) == 1)
 		return HnswGetEntryPoint(index);
 
-	/* 新布局：按列从 multi metapage 取 entrypoint */
 	HnswGetMetaPageInfoMulti(index, col, NULL, &entryPoint);
 
 	return entryPoint;
@@ -510,7 +502,7 @@ HnswGetHeadBlockColumn(Relation index, int col)
         elog(ERROR, "hnsw index is not valid");
     }
 
-    /* 旧布局：只有一张图，起点就是固定的 HNSW_HEAD_BLKNO */
+
     if (metap->version == HNSW_VERSION)
     {
         if (col != 0)
@@ -527,7 +519,7 @@ HnswGetHeadBlockColumn(Relation index, int col)
         return head;
     }
 
-    /* 新布局：从 multi metapage 里取该列的 insertPage 作为遍历起点 */
+
     if (metap->version == HNSW_VERSION_MULTI)
     {
         HnswMetaPageMulti meta2 = HnswPageGetMetaMulti(page);
@@ -556,7 +548,7 @@ HnswGetHeadBlockColumn(Relation index, int col)
 
         head = meta2->graphs[col].insertPage;
 
-        /* 你要求补的校验 */
+
         if (!BlockNumberIsValid(head))
         {
             LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -569,7 +561,7 @@ HnswGetHeadBlockColumn(Relation index, int col)
         return head;
     }
 
-    /* 未知版本 */
+
     {
         uint32 ver = metap->version;
         LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -583,9 +575,7 @@ HnswGetHeadBlockColumn(Relation index, int col)
 
 
 
-/*
- * Update the metapage info
- */
+
 static void
 HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, BlockNumber insertPage)
 {
@@ -617,13 +607,13 @@ HnswUpdateMetaPageInfoColumn(Page page, int col,
 							 HnswElement entryPoint,
 							 BlockNumber insertPage)
 {
-	/* 先用旧头读 magic/version：multi 布局开头也放这些字段，所以安全 */
+
     HnswMetaPage head = HnswPageGetMeta(page);
 
     if (unlikely(head->magicNumber != HNSW_MAGIC_NUMBER))
         elog(ERROR, "hnsw index is not valid");
 
-    /* 旧布局：单列索引，col 只能是 0，直接复用原版 helper */
+
     if (head->version == HNSW_VERSION)
     {
         if (col != 0)
@@ -635,7 +625,7 @@ HnswUpdateMetaPageInfoColumn(Page page, int col,
 
 
 
-	    /* 新布局：多图 */
+
     if (head->version == HNSW_VERSION_MULTI)
     {
         HnswMetaPageMulti meta = HnswPageGetMetaMulti(page);
@@ -649,7 +639,7 @@ HnswUpdateMetaPageInfoColumn(Page page, int col,
 
         HnswMetaPageData *g = &meta->graphs[col];
 
-        /* === 完全复刻原版 HnswUpdateMetaPageInfo 语义 === */
+
         if (updateEntry)
         {
             if (entryPoint == NULL)

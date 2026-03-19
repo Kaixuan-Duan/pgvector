@@ -12,19 +12,15 @@
 typedef struct HnswTopKItem
 {
     ItemPointerData tid;
-    float8 distance;   /* 现在不再读取真实值，仅占位 */
+    float8 distance;
 } HnswTopKItem;
 
-/*
- * col: 0-based，第几列/第几张图
- * orderby_op: 该列对应的距离算子 Oid（例如 <#> / <-> / <=>），强烈建议由 planner 从 OpExpr 提取后传入
- * query: 该列的 query 向量 Datum
- */
+
 int HnswTopKForColumn(Relation heapRel,
                       Relation indexRel,
                       int col,
                       Oid orderby_op,
                       Datum query,
                       int topk,
-                      HnswTopKItem *out,    /* caller alloc: topk 个 */
+                      HnswTopKItem *out,
                       int *out_nfound);

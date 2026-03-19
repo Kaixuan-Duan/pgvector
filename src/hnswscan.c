@@ -255,13 +255,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	return scan;
 }
 
-/*
- * Prepare for an index scan (multi-column)
- */
-/*
- * Prepare for an index scan (multi-column)
- * - 每列一份 HnswScanOpaqueData，完全独立（允许冗余但绝不串列）
- */
+
 IndexScanDesc
 hnswbeginscanmulti(Relation index, int nkeys, int norderbys)
 {
@@ -272,34 +266,26 @@ hnswbeginscanmulti(Relation index, int nkeys, int norderbys)
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
 
-	/* key 列数（不含 INCLUDE） */
+
 	nkeys_index = IndexRelationGetNumberOfKeyAttributes(index);
 
 	soMulti = (HnswScanOpaqueMulti) palloc0(sizeof(HnswScanOpaqueDataMulti));
 	soMulti->nkeys = nkeys_index;
 
-	/*
-	 * beginscan 阶段还无法确定 ORDER BY 使用哪一列：
-	 * 先默认 0，后续你在 rescan 链路里再设置 soMulti->col
-	 */
+
 	soMulti->col = 0;
 
-	/* 分配每列一份原版 opaque */
+
 	soMulti->cols = (HnswScanOpaqueData *) palloc0(sizeof(HnswScanOpaqueData) * nkeys_index);
 
 	for (int col = 0; col < nkeys_index; col++)
 	{
 		HnswScanOpaque so = &soMulti->cols[col];
 
-		/* typeInfo 必须按列取，支持不同向量类型 */
 		so->typeInfo = HnswGetTypeInfoColumn(index, col);
 
-		/* support 必须按列初始化，支持不同 opclass/procs */
 		HnswInitSupportColumn(&so->support, index, col);
 
-		/*
-		 * tmpCtx / maxMemory：按列各自一份（不共享，冗余但正确）
-		 */
 		so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 										   "Hnsw scan temporary context",
 										   0, 8 * 1024, 256 * 1024);
@@ -307,10 +293,7 @@ hnswbeginscanmulti(Relation index, int nkeys, int norderbys)
 		maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
 		so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
 
-		/* 其他字段保持 0/NULL（palloc0 已清零），后续 rescan/gettuple 再使用 */
 	}
-
-	/* opaque 放 multi 指针 */
 	scan->opaque = soMulti;
 
 	return scan;
@@ -365,7 +348,6 @@ hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
 	HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
 
-	/* 先根据 orderbys 决定本次 scan 用哪一列（0-based） */
 	int col = 0;
 	if (orderbys != NULL && norderbys > 0)
 	{
@@ -386,7 +368,6 @@ hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys,
 		pairingheap_reset(soMulti->tieheap);  /* 或 pfree+recreate */
 
 
-	/* 重置每一列的运行态状态（最安全，避免上一次 scan 的状态残留） */
 	for (int i = 0; i < soMulti->nkeys; i++)
 	{
 		HnswScanOpaque so = &soMulti->cols[i];
@@ -400,7 +381,6 @@ hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys,
 		MemoryContextReset(so->tmpCtx);
 	}
 
-	/* 拷贝 keys / orderbys（保持与原版一致） */
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
 
@@ -700,24 +680,14 @@ ComputeOtherDistancesFromHeap(IndexScanDesc scan,
 
     heapRel = scan->heapRelation;
 
-    /*
-     * Create a fetch context and a slot.
-     * NOTE: This is correct but not the most efficient (creates per call).
-     *       You can later cache fetch+slot in soMulti if you want.
-     */
+
     fetch = table_index_fetch_begin(heapRel);
     slot  = table_slot_create(heapRel, NULL);
 
-    /*
-     * table_index_fetch_tuple() may modify *tid when following HOT chains.
-     * So we pass a local copy.
-     */
+
     tid = *tid_in;
 
-    /*
-     * For MVCC snapshots, call_again should remain false after first successful fetch,
-     * but we keep the loop for completeness / safety.
-     */
+
     do
     {
         ExecClearTuple(slot);
@@ -732,10 +702,7 @@ ComputeOtherDistancesFromHeap(IndexScanDesc scan,
         if (!got)
             break;
 
-        /*
-         * Compute d2..dn using scan->orderByData[i].sk_func:
-         *   dist_i = sk_func(heap_value, query_argument)
-         */
+
         for (int i = 1; i < soMulti->norderbys; i++)
         {
             int     col = soMulti->orderby_cols[i]; /* index key col (0-based) */
@@ -1002,10 +969,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
         /* Count index scan for stats */
         pgstat_count_index_scan(scan->indexRelation);
 
-        /*
-         * 关键修复：GetScanValue 仍然是“单列假设”，
-         * 所以这里临时把 scan->opaque 切到当前列 so。
-         */
+
         PG_TRY();
         {
             scan->opaque = (void *) so;          /* 单列 opaque */
@@ -1025,7 +989,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
          */
         LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-        /* 关键改动 1：按列取 scan items（scan->opaque 仍是 Multi） */
+
         so->w = GetScanItemsColumn(scan, value, col);
 
         UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
@@ -1060,7 +1024,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
                 if (pairingheap_is_empty(so->discarded))
                     break;
 
-                /* Return remaining tuples */
+
                 so->w = lappend(so->w,
                                 HnswGetSearchCandidate(w_node,
                                                       pairingheap_remove_first(so->discarded)));
@@ -1069,7 +1033,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
             {
                 LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-                /* 关键改动 2：按列 resume（scan->opaque 仍是 Multi） */
+
                 so->w = ResumeScanItemsColumn(scan, col);
 
                 UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);

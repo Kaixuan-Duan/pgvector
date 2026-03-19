@@ -49,7 +49,7 @@ GetInsertPageColumn(Relation index, int col)
     if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
         elog(ERROR, "hnsw index is not valid");
 
-    /* 旧布局：只有一棵图 */
+
     if (metap->version == HNSW_VERSION)
     {
         if (col != 0)
@@ -61,7 +61,7 @@ GetInsertPageColumn(Relation index, int col)
         return insertPage;
     }
 
-    /* 新布局：多图 */
+
     if (metap->version == HNSW_VERSION_MULTI)
     {
         HnswMetaPageMulti meta2 = HnswPageGetMetaMulti(page);
@@ -745,23 +745,20 @@ UpdateGraphOnDiskMulti(Relation index, HnswSupport *support,
 {
 	BlockNumber newInsertPage = InvalidBlockNumber;
 
-	/* 旧布局兼容：单列索引仍然走原版 */
 	if (col == 0 && IndexRelationGetNumberOfKeyAttributes(index) == 1)
 	{
 		UpdateGraphOnDisk(index, support, element, m, efConstruction, entryPoint, building);
 		return;
 	}
 
-	/* Look for duplicate (按列查重，否则会跨列误判/误去重) */
 	if (FindDuplicateOnDisk(index, element, building))
 		return;
 
-	/* Add element (按列选择 insert page / 分配策略，否则不同列会写到同一套页面上) */
+
 	AddElementOnDisk(index, element, m,
 						   GetInsertPageColumn(index, col),
 						   &newInsertPage, building);
 
-	/* Update insert page if needed (按列更新 metapage 中的 insertPage[col]) */
 	if (BlockNumberIsValid(newInsertPage))
 		HnswUpdateMetaPageMulti(index, col,
 								 0 /* flags */,
@@ -769,12 +766,10 @@ UpdateGraphOnDiskMulti(Relation index, HnswSupport *support,
 								 newInsertPage,
 								 MAIN_FORKNUM, building);
 
-	/* Update neighbors (按列更新邻接边对应的页面/偏移) */
 	HnswUpdateNeighborsOnDisk(index, support, element, m,
 									false /* lockNeighbors */,
 									building);
 
-	/* Update entry point if needed (按列更新 metapage 中的 entryPoint[col]) */
 	if (entryPoint == NULL || element->level > entryPoint->level)
 		HnswUpdateMetaPageMulti(index, col,
 								 HNSW_UPDATE_ENTRY_GREATER,
@@ -784,10 +779,7 @@ UpdateGraphOnDiskMulti(Relation index, HnswSupport *support,
 }
 
 
-/*
- * Insert a tuple into the index
- */
-// todo dkx
+
 bool
 HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
 {
@@ -850,52 +842,46 @@ HnswInsertTupleOnDiskMulti(Relation index, HnswSupport *support,
 	LOCKMODE     lockmode = ShareLock;
 	char        *base = NULL;
 
-	/*
-	 * 仍然使用同一个 UPDATE_LOCK 页来保护“磁盘图更新”：
-	 * - 最小改动、最安全（所有列的 on-disk 更新串行）
-	 * - 兼容旧版 vacuum/repair 对这个锁的假设
-	 */
+
 	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
-	/* 按列读取 m 与 entryPoint（从 col 的 metapage/元信息中读取） */
+
 	HnswGetMetaPageInfoMulti(index, col, &m, &entryPoint);
 
-	/* Create an element (same as original) */
+
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
 	HnswPtrStore(base, element->value, DatumGetPointer(value));
 
-	/* Prevent concurrent inserts when likely updating entry point */
+
 	if (entryPoint == NULL || element->level > entryPoint->level)
 	{
-		/* Release shared lock */
+
 		UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
-		/* Get exclusive lock */
+
 		lockmode = ExclusiveLock;
 		LockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
-		/* 重新按列读取最新 entry point */
+
 		entryPoint = HnswGetEntryPointColumn(index, col);
 	}
 
-	/* Find neighbors for element (support 已经是按列初始化的即可复用) */
+
 	HnswFindElementNeighbors(base, element, entryPoint, index,
 							 support, m, efConstruction, false);
 
-	/* Update graph on disk (关键：按列写盘，避免不同列互相覆盖/串图) */
+
 	UpdateGraphOnDiskMulti(index, support, element, m, efConstruction,
 						   entryPoint, building, col);
 
-	/* Release lock */
+
 	UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
 	return true;
 }
 
 
-/*
- * Insert a tuple into the index
- */
+
 static void
 HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid)
 {
@@ -905,7 +891,7 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 
 	HnswInitSupport(&support, index);
 
-	/* Form index value */
+
 	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
 		return;
 
@@ -932,9 +918,9 @@ HnswInsertTupleColumn(Relation index, Datum *values, bool *isnull, ItemPointer h
 	 * Init support must be column-aware (attno = col + 1),
 	 * because different index columns can have different opclass/procs.
 	 */
-	HnswInitSupportColumn(&support, index, col);  /* 你需要提供这个函数 */
+	HnswInitSupportColumn(&support, index, col);
 
-	/* Reuse the original value-forming logic by slicing arrays */
+
 	if (!HnswFormIndexValue(&value, &values[col], &isnull[col], typeInfo, &support))
 		return;
 
@@ -996,10 +982,10 @@ hnswinsertmulti(Relation index, Datum *values, bool *isnull, ItemPointer heap_ti
 	int nkeys;
 	bool any = false;
 
-	/* 只看 key attrs，不把 INCLUDE 算进去 */
+
 	nkeys = indexInfo->ii_NumIndexKeyAttrs;
 
-	/* 所有 key 列都 NULL：直接跳过 */
+
 	for (int col = 0; col < nkeys; col++)
 	{
 		if (!isnull[col])
@@ -1011,15 +997,13 @@ hnswinsertmulti(Relation index, Datum *values, bool *isnull, ItemPointer heap_ti
 	if (!any)
 		return false;
 
-	/* Create memory context */
+
 	insertCtx = AllocSetContextCreate(CurrentMemoryContext,
 									  "Hnsw insert temporary context",
 									  ALLOCSET_DEFAULT_SIZES);
 	oldCtx = MemoryContextSwitchTo(insertCtx);
 
-	/*
-	 * 对每一列独立插入对应的图
-	 */
+
 	for (int col = 0; col < nkeys; col++)
 		HnswInsertTupleColumn(index, values, isnull, heap_tid, col);
 
