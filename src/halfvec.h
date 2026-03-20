@@ -6,7 +6,7 @@
 #include <float.h>
 
 /* We use two types of dispatching: intrinsics and target_clones */
-/* TODO Move to better place */
+
 #ifndef DISABLE_DISPATCH
 /* Only enable for more recent compilers to keep build process simple */
 #if defined(__x86_64__) && defined(__GNUC__) && __GNUC__ >= 9

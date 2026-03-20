@@ -133,9 +133,7 @@ HnswGetMColumn(Relation index, int col)
 	return HNSW_DEFAULT_M;
 }
 
-/*
- * Get the size of the dynamic candidate list in the index
- */
+
 int
 HnswGetEfConstruction(Relation index)
 {
@@ -164,9 +162,7 @@ HnswGetEfConstructionColumn(Relation index, int col)
 	return HNSW_DEFAULT_EF_CONSTRUCTION;
 }
 
-/*
- * Get proc
- */
+
 FmgrInfo *
 HnswOptionalProcInfo(Relation index, uint16 procnum)
 {
@@ -390,8 +386,6 @@ HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoin
 
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
-
-	/* 旧布局 */
 	if (metap->version == HNSW_VERSION)
 	{
 		if (col != 0)
@@ -415,7 +409,6 @@ HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoin
 		return;
 	}
 
-	/* 新布局 */
 	if (metap->version == HNSW_VERSION_MULTI)
 	{
 		HnswMetaPageMulti meta2 = HnswPageGetMetaMulti(page);
@@ -666,9 +659,7 @@ HnswUpdateMetaPageInfoColumn(Page page, int col,
     elog(ERROR, "hnsw metapage has unknown version: %u", head->version);
 }
 
-/*
- * Update the metapage
- */
+
 void
 HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building)
 {
@@ -725,22 +716,18 @@ HnswUpdateMetaPageMulti(Relation index, int col,
         page = GenericXLogRegisterBuffer(state, buf, 0);
     }
 
-    /* 先用旧结构读头：magic/version 在新布局开头也存在，所以安全 */
     HnswMetaPageData *head = HnswPageGetMeta(page);
 
     if (unlikely(head->magicNumber != HNSW_MAGIC_NUMBER))
         elog(ERROR, "hnsw index is not valid");
 
-    /* ---- 旧单列布局 ---- */
     if (head->version == HNSW_VERSION)
     {
         if (col != 0)
             elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
 
-        /* 复用原来的更新逻辑（你原工程里已有这个 helper） */
         HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
     }
-    /* ---- 新多列布局 ---- */
     else if (head->version == HNSW_VERSION_MULTI)
     {
     	HnswUpdateMetaPageInfoColumn(page, col, updateEntry, entryPoint, insertPage);

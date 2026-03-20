@@ -1632,9 +1632,9 @@ BuildIndexMulti(Relation heap, Relation index, IndexInfo *indexInfo,
 	SeedRandom(42);
 #endif
 
-	InitBuildStateMulti(buildstatemulti, heap, index, indexInfo, forkNum); // todo dkx
+	InitBuildStateMulti(buildstatemulti, heap, index, indexInfo, forkNum);
 
-	BuildGraphMulti(buildstatemulti, forkNum); // todo dkx
+	BuildGraphMulti(buildstatemulti, forkNum);
 
 	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
 		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
@@ -1666,9 +1666,9 @@ IndexBuildResult *
 hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	IndexBuildResult *result;
-	HnswBuildStateMulti buildstatemulti;           // todo dkx
+	HnswBuildStateMulti buildstatemulti;
 
-	BuildIndexMulti(heap, index, indexInfo, &buildstatemulti, MAIN_FORKNUM); // todo dkx
+	BuildIndexMulti(heap, index, indexInfo, &buildstatemulti, MAIN_FORKNUM);
 
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));	// 构建完成后，填充返回结果

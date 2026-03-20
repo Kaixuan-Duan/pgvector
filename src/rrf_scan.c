@@ -53,9 +53,7 @@ static List *rrf_func_oids = NIL;
 
 static bool rrf_func_oids_inited = false;
 
-/* * 全局上下文指针：用于在 CustomScan 执行器和 rrf() 函数之间传递分数。
- * 因为 PG 是单进程模型，在同一个查询执行线程中，这是安全的。
- */
+
 double *current_rrf_score = NULL;
 
 /* ---------------- Result structs ---------------- */
@@ -72,10 +70,10 @@ typedef struct RRFResultItem
     float8 d2;
 } RRFResultItem;
 
-/* hash entry 用 tid 做 key */
+
 typedef struct RRFHashEntry
 {
-    uint64 key;            /* (block<<16)|offset */
+    uint64 key;
     ItemPointerData tid;
     int32  r1;
     int32  r2;
@@ -94,7 +92,6 @@ typedef struct VectorRRFScanState
 
     TupleTableSlot *heapSlot;   /* for table_tuple_fetch_row_version */
 
-    /* from planner (custom_private) */
     int col1;   /* 0-based index key position */
     int col2;
 
@@ -110,7 +107,7 @@ typedef struct VectorRRFScanState
     ExprState *cand2_state;
     ExprState *limit_state;
 
-    /* evaluated parameters */
+
     Oid   op1;
     Oid   op2;
     int32 k_int;
@@ -121,7 +118,7 @@ typedef struct VectorRRFScanState
     int32 cand2;
     int32 limit;
 
-    /* precomputed results */
+
     RRFResultItem *results;
     int nresults;
     int cursor;
@@ -165,7 +162,6 @@ load_rrf_func_oids(void)
     if (rrf_func_oids_inited)
         return;
 
-    /* 防御：如果被踩坏，不是 OidList，直接丢弃重建 */
     if (rrf_func_oids != NIL && rrf_func_oids->type != T_OidList)
         rrf_func_oids = NIL;
 
@@ -224,16 +220,11 @@ rrf_funcid_is_rrf(Oid maybe_funcid)
 
     load_rrf_func_oids();
 
-    /*
-     * 防御：如果确实没有任何 rrf（例如没在 search_path / 没装扩展），返回 false。
-     */
+
     if (rrf_func_oids == NIL)
         return false;
 
-    /*
-     * 这里不会再触发 IsOidList，因为我们保证只用 lappend_oid 建 OidList，
-     * 且全程在 TopMemoryContext 分配。
-     */
+
     return list_member_oid(rrf_func_oids, maybe_funcid);
 }
 
@@ -263,7 +254,6 @@ static CustomPathMethods vector_rrf_path_methods = {
     .PlanCustomPath = vector_rrf_plan_custom_path
 };
 
-/* ---------- Helpers: find rrf() in ORDER BY ---------- */
 
 static Expr *
 strip_expr_wrappers(Expr *e)
@@ -322,7 +312,6 @@ cmp_rrf_item_desc(const void *a, const void *b)
     return 0;
 }
 
-/* 不用 get_sortgroupclause_tle，手工按 tleSortGroupRef 匹配 */
 static TargetEntry *
 find_tle_by_sortgroupref(List *tlist, Index ref)
 {
@@ -337,7 +326,6 @@ find_tle_by_sortgroupref(List *tlist, Index ref)
 }
 
 
-/* Find rrf() in ORDER BY target entry (MVP: single sort key, DESC only) */
 static FuncExpr *
 find_rrf_sort_expr(PlannerInfo *root, bool *is_desc_out)
 {
@@ -348,10 +336,7 @@ find_rrf_sort_expr(PlannerInfo *root, bool *is_desc_out)
 
     SortGroupClause *sgc = linitial_node(SortGroupClause, q->sortClause);
 
-    /*
-     * ORDER BY s1 的 s1 是 targetlist 里的某个 TargetEntry，
-     * 通过 tleSortGroupRef 找到对应的 TLE，然后取 tle->expr。
-     */
+
     TargetEntry *tle = find_tle_by_sortgroupref(q->targetList, sgc->tleSortGroupRef);
     if (tle == NULL)
         return NULL;
@@ -443,11 +428,11 @@ replace_rrf_in_tlist(List *tlist, int score_resno)
     return out;
 }
 
-/* Build custom_scan_tlist = all table columns + rrf_score placeholder */
+
 static List *
 build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score_resno_out)
 {
-    /* rel->relid 是 rtable 的 1-based 索引 */
+
     RangeTblEntry *rte = (RangeTblEntry *) list_nth(root->parse->rtable, rel->relid - 1);
 
     if (rte == NULL || rte->rtekind != RTE_RELATION)
@@ -468,10 +453,7 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
 
         if (att->attisdropped || !OidIsValid(att->atttypid))
         {
-            /*
-             * dropped 列 atttypid=0，不能 makeVar，否则 planner 会 cache lookup type 0
-             * 这里用一个“有类型”的 NULL 占位，并且保持 resno=attno 不变
-             */
+
             expr = (Expr *) makeNullConst(TEXTOID, -1, InvalidOid);
             colname = pstrdup("dropped");
         }
@@ -506,16 +488,16 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
     return scan_tlist;
 }
 
-/* ---------------- Hook: add CustomPath ---------------- */
+
 
 static void
 vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
-    /* 先让原 hook 跑 */
+
     if (prev_set_rel_pathlist_hook)
         prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
-    /* 只处理简单 base relation */
+
     if (rte->rtekind != RTE_RELATION)
         return;
     if (rel->reloptkind != RELOPT_BASEREL)
@@ -530,24 +512,19 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
         return;
 
     if (!is_desc)
-        return; /* RRF score only supports DESC in MVP */
+        return;
 
-    /*
-     * New signature:
-     * rrf(emb1, op1, q1, emb2, op2, q2, k?, w1?, w2?, cand1?, cand2?)
-     */
+
     int nargs = list_length(fe->args);
     if (nargs < 6)
         return;
 
     Expr *emb1 = strip_expr_wrappers((Expr *) list_nth(fe->args, 0));
-    //Expr *op1  = strip_expr_wrappers((Expr *) list_nth(fe->args, 1));
-    //Expr *q1   = strip_expr_wrappers((Expr *) list_nth(fe->args, 2));
-    Expr *emb2 = strip_expr_wrappers((Expr *) list_nth(fe->args, 3));
-    //Expr *op2  = strip_expr_wrappers((Expr *) list_nth(fe->args, 4));
-    //Expr *q2   = strip_expr_wrappers((Expr *) list_nth(fe->args, 5));
 
-    /* op/q 必须保留原始 typed node（不要 strip） */
+    Expr *emb2 = strip_expr_wrappers((Expr *) list_nth(fe->args, 3));
+
+
+
     Expr *op1  = (Expr *) list_nth(fe->args, 1);
     Expr *q1   = (Expr *) list_nth(fe->args, 2);
     Expr *op2  = (Expr *) list_nth(fe->args, 4);
@@ -556,7 +533,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     if (!IsA(emb1, Var) || !IsA(emb2, Var))
         return;
 
-    /* 在 append 前检查 */
+
     rrf_assert_expr_type(op1, "op1");
     rrf_assert_expr_type(q1,  "q1");
     rrf_assert_expr_type(op2, "op2");
@@ -565,7 +542,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     Var *v1 = (Var *) emb1;
     Var *v2 = (Var *) emb2;
 
-    /* 两个列必须来自同一张表（同一个 rti） */
+
     if (v1->varno != rti || v2->varno != rti)
         return;
 
@@ -574,14 +551,14 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     if (!pick_index_for_vars(rel, v1, v2, &indexoid, &col1, &col2))
         return;
 
-    /* optional args with defaults */
+
     Expr *k_expr     = (nargs >= 7)  ? (Expr *) list_nth(fe->args, 6)  : make_int4_const(60);
     Expr *w1_expr    = (nargs >= 8)  ? (Expr *) list_nth(fe->args, 7)  : make_float8_const(0.5);
     Expr *w2_expr    = (nargs >= 9)  ? (Expr *) list_nth(fe->args, 8)  : make_float8_const(0.5);
     Expr *cand1_expr = (nargs >= 10) ? (Expr *) list_nth(fe->args, 9)  : make_int4_const(200);
     Expr *cand2_expr = (nargs >= 11) ? (Expr *) list_nth(fe->args, 10) : make_int4_const(200);
 
-    /* LIMIT expr */
+
     Expr *limit_expr = (root->parse->limitCount != NULL) ?
                        (Expr *) root->parse->limitCount :
                        make_int4_const(0);
@@ -593,38 +570,24 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->path.param_info = NULL;
     cpath->path.rows = rel->rows;
 
-    /* 必须：否则 create_projection_path 会崩 ！！！！！！！！！！！！ */
+
     cpath->path.pathtarget = rel->reltarget;
 
-    /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
+
     cpath->path.startup_cost = 0;
     cpath->path.total_cost = 1;
 
-    /* 告诉 planner：我能提供 query 的排序（避免额外 Sort） */
+
     cpath->path.pathkeys = root->sort_pathkeys;
 
-    /* 避免未初始化字段在 planner 其它分支被用到 */
+
     cpath->path.parallel_aware = false;
     cpath->path.parallel_safe = rel->consider_parallel;
     cpath->path.parallel_workers = 0;
 
     cpath->methods = &vector_rrf_path_methods;
 
-    /* custom_private layout:
-     * 0 indexoid
-     * 1 col1
-     * 2 col2
-     * 3 limit_expr
-     * 4 op1_expr
-     * 5 op2_expr
-     * 6 q1_expr
-     * 7 q2_expr
-     * 8 k_expr
-     * 9 w1_expr
-     * 10 w2_expr
-     * 11 cand1_expr
-     * 12 cand2_expr
-     */
+
     cpath->custom_private = NIL;
     cpath->custom_private = lappend(cpath->custom_private, makeInteger(indexoid));
     cpath->custom_private = lappend(cpath->custom_private, makeInteger(col1));
@@ -643,7 +606,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     add_path(rel, &cpath->path);
 }
 
-/* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
+
 
 static Plan *
 vector_rrf_plan_custom_path(PlannerInfo *root,
@@ -662,11 +625,11 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
 
     cscan->scan.scanrelid = rel->relid;
 
-    /* build scan tuple (all columns + score) */
+
     int score_resno = 0;
     cscan->custom_scan_tlist = build_custom_scan_tlist_for_table(root, rel, &score_resno);
 
-    /* rewrite rrf(...) in this plan node targetlist to Var(INDEX_VAR, score_resno) */
+
     List *rewritten_tlist = replace_rrf_in_tlist(tlist, score_resno);
 
     cscan->scan.plan.targetlist = rewritten_tlist;
@@ -675,7 +638,7 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
     return &cscan->scan.plan;
 }
 
-/* ---------- Executor skeleton (MVP: error) ---------- */
+
 
 static Node *
 vector_rrf_create_scan_state(CustomScan *cscan)
@@ -740,10 +703,10 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
 {
     MemoryContext old = MemoryContextSwitchTo(st->rrf_mcxt);
 
-    /* evaluate params (op/k/w/cand/limit) */
+
     vector_rrf_eval_params(st);
 
-    /* Eval q1/q2 */
+
     ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
     bool isnull1 = false, isnull2 = false;
     Datum q1 = ExecEvalExprSwitchContext(st->q1_state, econtext, &isnull1);
@@ -754,30 +717,27 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     if (st->cand1 <= 0 || st->cand2 <= 0)
         ereport(ERROR, (errmsg("cand1/cand2 must be > 0")));
 
-    /* topK arrays */
+
     HnswTopKItem *list1 = palloc0(sizeof(HnswTopKItem) * st->cand1);
     HnswTopKItem *list2 = palloc0(sizeof(HnswTopKItem) * st->cand2);
     int n1 = 0, n2 = 0;
 
-    /* two topK */
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col1, st->op1, q1,
                       st->cand1, list1, &n1);
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2,
                       st->cand2, list2, &n2);
-    elog(WARNING, "VectorRRF: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
-     st->op1, st->op2, st->cand1, st->cand2, n1, n2);
 
 
-    /* merge by tid */
+
+
     HASHCTL ctl;
     memset(&ctl, 0, sizeof(ctl));
     ctl.keysize = sizeof(uint64);
     ctl.entrysize = sizeof(RRFHashEntry);
-    // HTAB *ht = hash_create("rrf_hash", n1 + n2, &ctl, HASH_ELEM);
+
     HTAB *ht = hash_create("rrf_hash", Max(n1 + n2, 16), &ctl, HASH_ELEM | HASH_BLOBS);
 
 
-    /* 路1 */
     for (int i = 0; i < n1; i++)
     {
         uint64 key = tid_to_key(&list1[i].tid);
@@ -796,7 +756,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         e->score += st->w1 / (st->k + (float8)(i + 1));
     }
 
-    /* 路2 */
+
     for (int i = 0; i < n2; i++)
     {
         uint64 key = tid_to_key(&list2[i].tid);
@@ -815,7 +775,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         e->score += st->w2 / (st->k + (float8)(i + 1));
     }
 
-    /* 5) hash → array */
+
     int cap = hash_get_num_entries(ht);
     RRFResultItem *arr = palloc0(sizeof(RRFResultItem) * cap);
 
@@ -837,7 +797,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         n++;
     }
 
-    /* 6) sort + 截断 top LIMIT */
+
     qsort(arr, n, sizeof(RRFResultItem), cmp_rrf_item_desc);
 
     if (st->limit > 0 && n > st->limit)
@@ -846,7 +806,6 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     st->results = arr;
     st->nresults = n;
     st->cursor = 0;
-    elog(WARNING, "VectorRRF: st->nresults=%d", n);
 
     MemoryContextSwitchTo(old);
 }
@@ -861,12 +820,12 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
 
     st->snapshot = estate->es_snapshot;
 
-    /* base rel */
+
     st->heapRel = node->ss.ss_currentRelation;
     if (st->heapRel == NULL)
         ereport(ERROR, (errmsg("VectorRRF requires ss_currentRelation for base table scan")));
 
-    /* open index */
+
     List *priv = cscan->custom_private;
     Oid indexoid = intVal((Node *) list_nth(priv, 0));
     st->col1 = intVal((Node *) list_nth(priv, 1));
@@ -874,7 +833,7 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
 
     st->indexRel = index_open(indexoid, AccessShareLock);
 
-    /* expr nodes from custom_private */
+
     Expr *limit_expr = (Expr *) list_nth(priv, 3);
     Expr *op1_expr    = (Expr *) list_nth(priv, 4);
     Expr *op2_expr    = (Expr *) list_nth(priv, 5);
@@ -897,21 +856,17 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
     st->cand1_state = ExecInitExpr(cand1_expr, (PlanState *) node);
     st->cand2_state = ExecInitExpr(cand2_expr, (PlanState *) node);
 
-    /* memory context for precomputed results */
+
     st->rrf_mcxt = AllocSetContextCreate(estate->es_query_cxt,
                                          "vector_rrf_mcxt",
                                          ALLOCSET_DEFAULT_SIZES);
 
-    /* heap fetch slot */
+
     st->heapSlot = ExecInitExtraTupleSlot(estate,
                                           RelationGetDescr(st->heapRel),
                                           &TTSOpsBufferHeapTuple);
 
-    /*
-     * IMPORTANT:
-     * Use index-fetch API so HOT root TIDs can be followed to visible tuple versions
-     * (same behavior as normal IndexScan executor path).
-     */
+
     st->fetch = table_index_fetch_begin(st->heapRel);
 
     /* compute results */
@@ -951,16 +906,13 @@ vector_rrf_exec(CustomScanState *node)
 
         ExecClearTuple(st->heapSlot);
 
-        /* 1) fetch heap tuple */
+
 
         bool ok = false;
         bool call_again = false;
         bool all_dead = false;
 
-        /*
-         * Use index fetch path: this follows HOT chains / redirect tuples
-         * and returns the visible version for the snapshot (like IndexScan does).
-         */
+
         do {
             call_again = false;
             ExecClearTuple(st->heapSlot);
@@ -993,16 +945,15 @@ vector_rrf_exec(CustomScanState *node)
             continue;
 
 
-        /* 1. 设置全局指针 (指向当前结果的 score) */
-        /* 注意：这个地址在 st->results 数组释放前都是有效的 */
+
         current_rrf_score = &it->score;
-        /* Debug 日志: 证明我们设置了 */
+
         elog(WARNING, "VectorRRF exec: set global ptr for cursor=%d score=%.6f", st->cursor, it->score);
 
-        /* fill scanSlot = all heap cols + score (last) */
+
         ExecClearTuple(scanSlot);
 
-        /* Ensure heapSlot attrs are extracted */
+
         slot_getallattrs(st->heapSlot);
 
         int natts_heap = st->heapSlot->tts_tupleDescriptor->natts;
@@ -1012,7 +963,7 @@ vector_rrf_exec(CustomScanState *node)
              "VectorRRF exec: natts_heap=%d natts_scan=%d (expect scan=heap+1)",
              natts_heap, natts_scan);
 
-        /* expect scan = heap + 1 */
+
         if (natts_scan != natts_heap + 1)
             ereport(ERROR,
                     (errmsg("VectorRRF scan slot natts=%d does not match heap natts+1=%d",
@@ -1029,7 +980,7 @@ vector_rrf_exec(CustomScanState *node)
 
         ExecStoreVirtualTuple(scanSlot);
 
-        /* qual */
+
         econtext->ecxt_scantuple = scanSlot;
         if (node->ss.ps.qual && !ExecQual(node->ss.ps.qual, econtext))
         {
@@ -1039,20 +990,14 @@ vector_rrf_exec(CustomScanState *node)
                  ItemPointerGetOffsetNumber(&it->tid));
             continue;
         }
-        /* --- 修改开始 --- */
 
-        /* projection: fill ps_ResultTupleSlot and return */
         if (node->ss.ps.ps_ProjInfo)
         {
 
-            /* 2. 执行投影。此时 ExecProject 会调用 SQL 中的 rrf() 函数 */
+
             TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
 
-            /* 3. 【用完即焚】调用完必须置空，防止污染其他调用 */
-            /* * [关键修正]：千万不要在这里 current_rrf_score = NULL;
-             * 因为 return out 之后，上层节点(Result Node) 还会立刻再次调用 rrf()！
-             */
-            /* Debug 日志 (可选) */
+
             elog(WARNING, "VectorRRF exec: passed score %.6f via global ptr", it->score);
             elog(WARNING,
                  "VectorRRF exec: returned projected tuple for tid=%u/%u",
@@ -1061,18 +1006,7 @@ vector_rrf_exec(CustomScanState *node)
 
             return out;
         }
-        /* --- 修改结束 --- */
 
-        /* projection: fill ps_ResultTupleSlot and return */
-        // if (node->ss.ps.ps_ProjInfo)
-        // {
-        //     TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
-        //     elog(WARNING,
-        //          "VectorRRF exec: returned projected tuple for tid=%u/%u",
-        //          ItemPointerGetBlockNumber(&it->tid),
-        //          ItemPointerGetOffsetNumber(&it->tid));
-        //     return out;
-        // }
 
         ExecCopySlot(resultSlot, scanSlot);
         elog(WARNING,
@@ -1081,9 +1015,6 @@ vector_rrf_exec(CustomScanState *node)
              ItemPointerGetOffsetNumber(&it->tid));
         return resultSlot;
     }
-    /* 3. 只有在扫描结束 (EOF) 时，才清空指针 */
-    // current_rrf_score = NULL;
-    // elog(WARNING, "VectorRRF exec: EOF, cleared global ptr");
 
     elog(WARNING, "VectorRRF exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
     return NULL;
@@ -1093,7 +1024,7 @@ vector_rrf_exec(CustomScanState *node)
 static void
 vector_rrf_end(CustomScanState *node)
 {
-    /* 安全清理 */
+
     current_rrf_score = NULL;
     VectorRRFScanState *st = (VectorRRFScanState *) node;
 
@@ -1104,7 +1035,7 @@ vector_rrf_end(CustomScanState *node)
     if (st->indexRel)
         index_close(st->indexRel, AccessShareLock);
 
-    /* rrf_mcxt 挂在 es_query_cxt 下，一般不手动删也行；想严谨可删 */
+
 }
 
 static void
@@ -1112,7 +1043,7 @@ vector_rrf_rescan(CustomScanState *node)
 {
     VectorRRFScanState *st = (VectorRRFScanState *) node;
 
-    /* if params may change, recompute */
+
     MemoryContextReset(st->rrf_mcxt);
     vector_rrf_prepare_results(st);
 }
@@ -1133,7 +1064,7 @@ vector_rrf_explain(CustomScanState *node, List *ancestors, ExplainState *es)
         ExplainPropertyInteger("col2", NULL, intVal((Node *) list_nth(priv, 2)), es);
     }
 
-    /* executor-time evaluated params */
+
     ExplainPropertyInteger("k", NULL, st->k_int, es);
     ExplainPropertyFloat("w1", NULL, st->w1, 3, es);
     ExplainPropertyFloat("w2", NULL, st->w2, 3, es);
@@ -1146,13 +1077,13 @@ vector_rrf_explain(CustomScanState *node, List *ancestors, ExplainState *es)
     (void) ancestors;
 }
 
-/* ---------------- Extension init ---------------- */
+
 
 void
 VectorRrfInit(void)
 {
-    RegisterCustomScanMethods(&vector_rrf_scan_methods); /* 注册 CustomScan methods（必须） */
+    RegisterCustomScanMethods(&vector_rrf_scan_methods);
 
-    prev_set_rel_pathlist_hook = set_rel_pathlist_hook; /* 安装 hook */
+    prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
     set_rel_pathlist_hook = vector_rrf_set_rel_pathlist_hook;
 }

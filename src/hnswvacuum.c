@@ -18,11 +18,7 @@ DeletedContains(tidhash_hash * deleted, ItemPointer indextid)
 	return tidhash_lookup(deleted, *indextid) != NULL;
 }
 
-/*
- * Remove deleted heap TIDs
- *
- * OK to remove for entry point, since always considered for searches and inserts
- */
+
 static void
 RemoveHeapTids(HnswVacuumState * vacuumstate)
 {
@@ -131,11 +127,7 @@ RemoveHeapTids(HnswVacuumState * vacuumstate)
 	}
 }
 
-/*
- * Remove deleted heap TIDs (column-specific)
- *
- * col: 0-based index key column (0 for emb1 graph, 1 for emb2 graph, ...)
- */
+
 static void
 RemoveHeapTidsColumn(HnswVacuumState *vacuumstate, int col)
 {
@@ -253,9 +245,7 @@ RemoveHeapTidsColumn(HnswVacuumState *vacuumstate, int col)
 }
 
 
-/*
- * Check for deleted neighbors
- */
+
 static bool
 NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 {
@@ -273,7 +263,6 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 
 	Assert(HnswIsNeighborTuple(ntup));
 
-	/* Check neighbors */
 	for (int i = 0; i < ntup->count; i++)
 	{
 		ItemPointer indextid = &ntup->indextids[i];
@@ -299,9 +288,7 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 	return needsUpdated;
 }
 
-/*
- * Repair graph for a single element
- */
+
 static void
 RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswElement entryPoint)
 {
@@ -402,20 +389,10 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 
 		if (DeletedContains(vacuumstate->deleted, &epData))
 		{
-			/*
-			 * Replace the entry point with the highest point. If highest
-			 * point is outdated and empty, the entry point will be empty
-			 * until an element is repaired.
-			 */
 			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false);
 		}
 		else
 		{
-			/*
-			 * Repair the entry point with the highest point. If highest point
-			 * is outdated, this can remove connections at higher levels in
-			 * the graph until they are repaired, but this should be fine.
-			 */
 			HnswLoadElement(entryPoint, NULL, NULL, index, support, true, NULL);
 
 			if (NeedsUpdated(vacuumstate, entryPoint))
@@ -453,16 +430,12 @@ RepairGraphEntryPointColumn(HnswVacuumState *vacuumstate, int col)
     if (!BlockNumberIsValid(highestPoint->blkno))
         highestPoint = NULL;
 
-    /*
-     * Repair graph for highest non-entry point. Highest point may be outdated
-     * due to inserts that happen during and after RemoveHeapTidsColumn.
-     */
+
     if (highestPoint != NULL)
     {
         /* Get a shared lock */
         LockPage(index, HNSW_UPDATE_LOCK, ShareLock);
 
-        /* Load element */
         HnswLoadElement(highestPoint, NULL, NULL, index, support, true, NULL);
 
         /* Repair if needed */
@@ -487,11 +460,6 @@ RepairGraphEntryPointColumn(HnswVacuumState *vacuumstate, int col)
 
         if (DeletedContains(vacuumstate->deleted, &epData))
         {
-            /*
-             * Replace the entry point with the highest point. If highest
-             * point is outdated and empty, the entry point will be empty
-             * until an element is repaired.
-             */
             HnswUpdateMetaPageMulti(index,
                                     col,
                                     HNSW_UPDATE_ENTRY_ALWAYS,
@@ -502,16 +470,10 @@ RepairGraphEntryPointColumn(HnswVacuumState *vacuumstate, int col)
         }
         else
         {
-            /*
-             * Repair the entry point with the highest point. If highest point
-             * is outdated, this can remove connections at higher levels in
-             * the graph until they are repaired, but this should be fine.
-             */
             HnswLoadElement(entryPoint, NULL, NULL, index, support, true, NULL);
 
             if (NeedsUpdated(vacuumstate, entryPoint))
             {
-                /* Reset neighbors from previous update */
                 if (highestPoint != NULL)
                     HnswPtrStore((char *) NULL, highestPoint->neighbors, (HnswNeighborArrayPtr *) NULL);
 
@@ -529,9 +491,7 @@ RepairGraphEntryPointColumn(HnswVacuumState *vacuumstate, int col)
 }
 
 
-/*
- * Repair graph for all elements
- */
+
 static void
 RepairGraph(HnswVacuumState * vacuumstate)
 {
@@ -539,14 +499,10 @@ RepairGraph(HnswVacuumState * vacuumstate)
 	BufferAccessStrategy bas = vacuumstate->bas;
 	BlockNumber blkno = HNSW_HEAD_BLKNO;
 
-	/*
-	 * Wait for inserts to complete. Inserts before this point may have
-	 * neighbors about to be deleted. Inserts after this point will not.
-	 */
+
 	LockPage(index, HNSW_UPDATE_LOCK, ExclusiveLock);
 	UnlockPage(index, HNSW_UPDATE_LOCK, ExclusiveLock);
 
-	/* Repair entry point first */
 	RepairGraphEntryPoint(vacuumstate);
 
 	while (BlockNumberIsValid(blkno))
@@ -656,12 +612,7 @@ RepairGraphColumn(HnswVacuumState *vacuumstate, int col)
     /* MUST be the head block of this column's graph */
     BlockNumber blkno = HnswGetHeadBlockColumn(index, col);
 
-    /*
-     * Wait for inserts to complete. Inserts before this point may have
-     * neighbors about to be deleted. Inserts after this point will not.
-     *
-     * 仍然用同一个 UPDATE_LOCK 页：最小改动且最安全（所有列串行修图）
-     */
+
     LockPage(index, HNSW_UPDATE_LOCK, ExclusiveLock);
     UnlockPage(index, HNSW_UPDATE_LOCK, ExclusiveLock);
 
@@ -747,12 +698,7 @@ RepairGraphColumn(HnswVacuumState *vacuumstate, int col)
             /* Repair connections (element 属于该列图，所以原逻辑可复用) */
             RepairGraphElement(vacuumstate, element, entryPoint);
 
-            /*
-             * Update metapage if needed. Should only happen if entry point
-             * was replaced and highest point was outdated.
-             *
-             * 这里必须按列更新 metapage 的 graphs[col].entry*
-             */
+
             if (entryPoint == NULL || element->level > entryPoint->level)
             {
             	HnswUpdateMetaPageMulti(index,
@@ -910,9 +856,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false);
 }
 
-/*
- * Mark items as deleted (column-specific)
- */
+
 static void
 MarkDeletedColumn(HnswVacuumState *vacuumstate, int col)
 {
@@ -925,13 +869,6 @@ MarkDeletedColumn(HnswVacuumState *vacuumstate, int col)
     /* per-column insertPage to update into metapage */
     BlockNumber insertPage = InvalidBlockNumber;
 
-    /*
-     * Wait for index scans to complete. Scans before this point may contain
-     * tuples about to be deleted. Scans after this point will not, since the
-     * graph has been repaired.
-     *
-     * 仍然使用同一个 SCAN_LOCK：最小改动、最安全（所有列串行）
-     */
     LockPage(index, HNSW_SCAN_LOCK, ExclusiveLock);
     UnlockPage(index, HNSW_SCAN_LOCK, ExclusiveLock);
 
@@ -947,19 +884,14 @@ MarkDeletedColumn(HnswVacuumState *vacuumstate, int col)
 
         buf = ReadBufferExtended(index, MAIN_FORKNUM, blkno, RBM_NORMAL, bas);
 
-        /*
-         * ambulkdelete cannot delete entries from pages that are pinned by
-         * other backends
-         *
-         * https://www.postgresql.org/docs/current/index-locking.html
-         */
+
         LockBufferForCleanup(buf);
 
         state = GenericXLogStart(index);
         page = GenericXLogRegisterBuffer(state, buf, 0);
         maxoffno = PageGetMaxOffsetNumber(page);
 
-        /* Update element and neighbors together */
+
         for (offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
         {
             HnswElementTuple etup =
@@ -1040,7 +972,6 @@ MarkDeletedColumn(HnswVacuumState *vacuumstate, int col)
         UnlockReleaseBuffer(buf);
     }
 
-    /* Update insert page last, after everything has been marked as deleted (column-specific) */
     HnswUpdateMetaPageMulti(index,
                             col,
                             0,                  /* updateEntry: none */
@@ -1051,9 +982,7 @@ MarkDeletedColumn(HnswVacuumState *vacuumstate, int col)
 }
 
 
-/*
- * Initialize the vacuum state
- */
+
 static void
 InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state)
 {
@@ -1088,7 +1017,6 @@ InitVacuumStateColumn(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, Inde
 {
 	Relation index = info->index;
 
-	/* stats: share one stats across columns (caller can pass same pointer) */
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
@@ -1130,9 +1058,7 @@ FreeVacuumState(HnswVacuumState * vacuumstate)
 	MemoryContextDelete(vacuumstate->tmpCtx);
 }
 
-/*
- * Bulk delete tuples from the index
- */
+
 IndexBulkDeleteResult *
 hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			   IndexBulkDeleteCallback callback, void *callback_state)
@@ -1141,13 +1067,10 @@ hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	InitVacuumState(&vacuumstate, info, stats, callback, callback_state);
 
-	/* Pass 1: Remove heap TIDs */
 	RemoveHeapTids(&vacuumstate);
 
-	/* Pass 2: Repair graph */
 	RepairGraph(&vacuumstate);
 
-	/* Pass 3: Mark as deleted */
 	MarkDeleted(&vacuumstate);
 
 	FreeVacuumState(&vacuumstate);
@@ -1155,12 +1078,7 @@ hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return vacuumstate.stats;
 }
 
-/*
- * Bulk delete tuples from the index (multi-column)
- *
- * 要求：你需要一个按列初始化的 InitVacuumStateColumn()
- *      或者让 InitVacuumState() 本身支持 vacuumstate->col 并按 col 读写 meta/graph。
- */
+
 IndexBulkDeleteResult *
 hnswbulkdeletemulti(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					IndexBulkDeleteCallback callback, void *callback_state)
@@ -1172,24 +1090,19 @@ hnswbulkdeletemulti(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	{
 		HnswVacuumState vacuumstate;
 
-		/*
-		 * 关键点：必须是“按列”的 vacuum state 初始化
-		 * - 初始化 support（类似 HnswInitSupportColumn）
-		 * - 读取该列 metapage/entrypoint/m/页布局等
-		 * - stats 传同一个指针以便跨列累计
-		 */
+
 		InitVacuumStateColumn(&vacuumstate, info, stats, callback, callback_state, col);
 
-		/* Pass 1: Remove heap TIDs (针对该列图) */
+
 		RemoveHeapTidsColumn(&vacuumstate, col);
 
-		/* Pass 2: Repair graph (针对该列图) */
+
 		RepairGraphColumn(&vacuumstate,col);
 
-		/* Pass 3: Mark as deleted (针对该列图) */
+
 		MarkDeletedColumn(&vacuumstate, col);
 
-		/* 把累计 stats 拿出来继续给下一列用 */
+
 		stats = vacuumstate.stats;
 
 		FreeVacuumState(&vacuumstate);

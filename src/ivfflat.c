@@ -219,7 +219,7 @@ ivfflathandler(PG_FUNCTION_ARGS)
 	amroutine->amcanreturn = NULL;	/* tuple not included in heapsort */
 	amroutine->amcostestimate = ivfflatcostestimate;
 	amroutine->amoptions = ivfflatoptions;
-	amroutine->amproperty = NULL;	/* TODO AMPROP_DISTANCE_ORDERABLE */
+	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = ivfflatbuildphasename;
 	amroutine->amvalidate = ivfflatvalidate;
 #if PG_VERSION_NUM >= 140000

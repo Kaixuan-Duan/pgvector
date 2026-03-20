@@ -71,11 +71,7 @@ GetScanItemsColumn(IndexScanDesc scan, Datum value, int col)
 	char *base = NULL;
 	HnswQuery *q = &so->q;
 
-	/*
-	 * 关键差异：按列读取 m / entryPoint
-	 * - 旧布局时 HnswGetMetaPageInfoMulti(col=0) 会兼容
-	 * - 新布局时会取 graphs[col]
-	 */
+
 	HnswGetMetaPageInfoMulti(index, col, &m, &entryPoint);
 
 	q->value = value;
@@ -108,9 +104,7 @@ GetScanItemsColumn(IndexScanDesc scan, Datum value, int col)
 }
 
 
-/*
- * Resume scan at ground level with discarded candidates
- */
+
 static List *
 ResumeScanItems(IndexScanDesc scan)
 {
@@ -237,16 +231,11 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	/* Set support functions */
 	HnswInitSupport(&so->support, index);
 
-	/*
-	 * Use a lower max allocation size than default to allow scanning more
-	 * tuples for iterative search before exceeding work_mem
-	 */
+
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "Hnsw scan temporary context",
 									   0, 8 * 1024, 256 * 1024);
 
-	/* Calculate max memory */
-	/* Add 256 extra bytes to fill last block when close */
 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
 	so->maxMemory = Min(maxMemory, (double) SIZE_MAX);
 
@@ -319,9 +308,7 @@ hnswbeginscan_dispatch(Relation index, int nkeys, int norderbys)
 
 
 
-/*
- * Start or restart an index scan
- */
+
 void
 hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys)
 {
@@ -402,9 +389,7 @@ hnswrescan_dispatch(IndexScanDesc scan, ScanKey keys, int nkeys,
 }
 
 
-/*
- * Fetch the next tuple in the given scan
- */
+
 bool
 hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 {
@@ -902,10 +887,7 @@ hnswgettuplemulti_lex(IndexScanDesc scan, ScanDirection dir)
                 tc->tid = *tid;
                 tc->dists = palloc(sizeof(float8) * soMulti->norderbys);
 
-                /*
-                 * d1 from index candidate; d2.. must be computed (heap or other mapping).
-                 * If compute fails (invisible/dead), skip.
-                 */
+
                 if (!ComputeOtherDistancesFromHeap(scan, soMulti, tid, d1, tc->dists))
                 {
                     pfree(tc->dists);

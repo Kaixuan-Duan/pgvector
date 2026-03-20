@@ -247,9 +247,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 		if (!BlockNumberIsValid(newInsertPage) && PageGetFreeSpace(page) >= minCombinedSize)
 			newInsertPage = currentPage;
 
-		/* First, try the fastest path */
-		/* Space for both tuples on the current page */
-		/* This can split existing tuples in rare cases */
+
 		if (PageGetFreeSpace(page) >= combinedSize)
 		{
 			nbuf = buf;
@@ -299,13 +297,12 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 
 			HnswInsertAppendPage(index, &newbuf, &newpage, state, page, building);
 
-			/* Commit */
+
 			if (building)
 				MarkBufferDirty(buf);
 			else
 				GenericXLogFinish(state);
 
-			/* Unlock previous buffer */
 			UnlockReleaseBuffer(buf);
 
 			/* Prepare new buffer */
@@ -321,7 +318,6 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 				page = GenericXLogRegisterBuffer(state, buf, 0);
 			}
 
-			/* Create new page for neighbors if needed */
 			if (PageGetFreeSpace(page) < combinedSize)
 				HnswInsertAppendPage(index, &nbuf, &npage, state, page, building);
 			else
@@ -337,8 +333,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	e->blkno = BufferGetBlockNumber(buf);
 	e->neighborPage = BufferGetBlockNumber(nbuf);
 
-	/* Added tuple to new page if newInsertPage is not set */
-	/* So can set to neighbor page instead of element page */
+
 	if (!BlockNumberIsValid(newInsertPage))
 		newInsertPage = e->neighborPage;
 
@@ -468,12 +463,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 	 */
 	neighbors = HnswLoadNeighbors(element, index, m, lm, lc);
 
-	/*
-	 * Could improve performance for vacuuming by checking neighbors against
-	 * list of elements being deleted to find index. It's important to exclude
-	 * already deleted elements for this since they can be replaced at any
-	 * time.
-	 */
+
 
 	if (neighbors->length < lm)
 		idx = -2;
@@ -553,8 +543,7 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 		idx = -1;
 	else if (idx == -2)
 	{
-		/* Find free offset if still exists */
-		/* TODO Retry updating connections if not */
+
 		for (int j = 0; j < lm; j++)
 		{
 			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j]))
@@ -595,7 +584,6 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, 
 {
 	char	   *base = NULL;
 
-	/* Use separate memory context to improve performance for larger vectors */
 	MemoryContext updateCtx = GenerationContextCreate(CurrentMemoryContext,
 													  "Hnsw insert update context",
 #if PG_VERSION_NUM >= 150000
@@ -790,11 +778,7 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	LOCKMODE	lockmode = ShareLock;
 	char	   *base = NULL;
 
-	/*
-	 * Get a shared lock. This allows vacuum to ensure no in-flight inserts
-	 * before repairing graph. Use a page lock so it does not interfere with
-	 * buffer lock (or reads when vacuuming).
-	 */
+
 	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
 	/* Get m and entry point */
@@ -913,11 +897,7 @@ HnswInsertTupleColumn(Relation index, Datum *values, bool *isnull, ItemPointer h
 	if (isnull[col])
 		return;
 
-	/*
-	 * IMPORTANT:
-	 * Init support must be column-aware (attno = col + 1),
-	 * because different index columns can have different opclass/procs.
-	 */
+
 	HnswInitSupportColumn(&support, index, col);
 
 

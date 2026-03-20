@@ -23,9 +23,7 @@ typedef struct SparseInputElement
 	float		value;
 }			SparseInputElement;
 
-/*
- * Ensure same dimensions
- */
+
 static inline void
 CheckDims(SparseVector * a, SparseVector * b)
 {
@@ -35,9 +33,7 @@ CheckDims(SparseVector * a, SparseVector * b)
 				 errmsg("different sparsevec dimensions %d and %d", a->dim, b->dim)));
 }
 
-/*
- * Ensure expected dimensions
- */
+
 static inline void
 CheckExpectedDim(int32 typmod, int dim)
 {
@@ -47,9 +43,7 @@ CheckExpectedDim(int32 typmod, int dim)
 				 errmsg("expected %d dimensions, not %d", typmod, dim)));
 }
 
-/*
- * Ensure valid dimensions
- */
+
 static inline void
 CheckDim(int dim)
 {
@@ -64,9 +58,7 @@ CheckDim(int dim)
 				 errmsg("sparsevec cannot have more than %d dimensions", SPARSEVEC_MAX_DIM)));
 }
 
-/*
- * Ensure valid nnz
- */
+
 static inline void
 CheckNnz(int nnz, int dim)
 {
@@ -86,9 +78,7 @@ CheckNnz(int nnz, int dim)
 				 errmsg("sparsevec cannot have more elements than dimensions")));
 }
 
-/*
- * Ensure valid index
- */
+
 static inline void
 CheckIndex(int32 *indices, int i, int dim)
 {
@@ -115,9 +105,7 @@ CheckIndex(int32 *indices, int i, int dim)
 	}
 }
 
-/*
- * Ensure finite element
- */
+
 static inline void
 CheckElement(float value)
 {
@@ -132,9 +120,7 @@ CheckElement(float value)
 				 errmsg("infinite value not allowed in sparsevec")));
 }
 
-/*
- * Allocate and initialize a new sparse vector
- */
+
 SparseVector *
 InitSparseVector(int dim, int nnz)
 {
@@ -150,9 +136,7 @@ InitSparseVector(int dim, int nnz)
 	return result;
 }
 
-/*
- * Check for whitespace, since array_isspace() is static
- */
+
 static inline bool
 sparsevec_isspace(char ch)
 {
@@ -166,9 +150,7 @@ sparsevec_isspace(char ch)
 	return false;
 }
 
-/*
- * Compare indices
- */
+
 static int
 CompareIndices(const void *a, const void *b)
 {
@@ -181,9 +163,7 @@ CompareIndices(const void *a, const void *b)
 	return 0;
 }
 
-/*
- * Convert textual representation to internal representation
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_in);
 Datum
 sparsevec_in(PG_FUNCTION_ARGS)
@@ -247,14 +227,10 @@ sparsevec_in(PG_FUNCTION_ARGS)
 
 			while (sparsevec_isspace(*pt))
 				pt++;
-
-			/* Check for empty string like float4in */
 			if (*pt == '\0')
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("invalid input syntax for type sparsevec: \"%s\"", lit)));
-
-			/* Use similar logic as int2vectorin */
 			index = strtol(pt, &stringEnd, 10);
 
 			if (stringEnd == pt)
@@ -262,7 +238,6 @@ sparsevec_in(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("invalid input syntax for type sparsevec: \"%s\"", lit)));
 
-			/* Keep in int range for correct error message later */
 			if (index > INT_MAX)
 				index = INT_MAX;
 			else if (index < INT_MIN + 1)
@@ -285,8 +260,7 @@ sparsevec_in(PG_FUNCTION_ARGS)
 
 			errno = 0;
 
-			/* Use strtof like float4in to avoid a double-rounding problem */
-			/* Postgres sets LC_NUMERIC to C on startup */
+
 			value = strtof(pt, &stringEnd);
 
 			if (stringEnd == pt)
@@ -302,10 +276,9 @@ sparsevec_in(PG_FUNCTION_ARGS)
 
 			CheckElement(value);
 
-			/* Do not store zero values */
+
 			if (value != 0)
 			{
-				/* Convert 1-based numbering (SQL) to 0-based (C) */
 				elements[nnz].index = index - 1;
 				elements[nnz].value = value;
 				nnz++;
@@ -344,7 +317,6 @@ sparsevec_in(PG_FUNCTION_ARGS)
 	while (sparsevec_isspace(*pt))
 		pt++;
 
-	/* Use similar logic as int2vectorin */
 	dim = strtol(pt, &stringEnd, 10);
 
 	if (stringEnd == pt)
@@ -352,7 +324,6 @@ sparsevec_in(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type sparsevec: \"%s\"", lit)));
 
-	/* Keep in int range for correct error message later */
 	if (dim > INT_MAX)
 		dim = INT_MAX;
 	else if (dim < INT_MIN)
@@ -360,7 +331,6 @@ sparsevec_in(PG_FUNCTION_ARGS)
 
 	pt = stringEnd;
 
-	/* Only whitespace is allowed after the closing brace */
 	while (sparsevec_isspace(*pt))
 		pt++;
 
@@ -402,9 +372,7 @@ sparsevec_in(PG_FUNCTION_ARGS)
 	} while (0)
 #endif
 
-/*
- * Convert internal representation to textual representation
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_out);
 Datum
 sparsevec_out(PG_FUNCTION_ARGS)
@@ -414,22 +382,7 @@ sparsevec_out(PG_FUNCTION_ARGS)
 	char	   *buf;
 	char	   *ptr;
 
-	/*
-	 * Need:
-	 *
-	 * nnz * 10 bytes for index (positive integer)
-	 *
-	 * nnz bytes for :
-	 *
-	 * nnz * (FLOAT_SHORTEST_DECIMAL_LEN - 1) bytes for
-	 * float_to_shortest_decimal_bufn
-	 *
-	 * nnz - 1 bytes for ,
-	 *
-	 * 10 bytes for dimensions
-	 *
-	 * 4 bytes for {, }, /, and \0
-	 */
+
 	buf = (char *) palloc((11 + FLOAT_SHORTEST_DECIMAL_LEN) * sparsevec->nnz + 13);
 	ptr = buf;
 
@@ -440,7 +393,6 @@ sparsevec_out(PG_FUNCTION_ARGS)
 		if (i > 0)
 			AppendChar(ptr, ',');
 
-		/* Convert 0-based numbering (C) to 1-based (SQL) */
 		AppendInt(ptr, sparsevec->indices[i] + 1);
 		AppendChar(ptr, ':');
 		AppendFloat(ptr, values[i]);
@@ -455,9 +407,7 @@ sparsevec_out(PG_FUNCTION_ARGS)
 	PG_RETURN_CSTRING(buf);
 }
 
-/*
- * Convert type modifier
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_typmod_in);
 Datum
 sparsevec_typmod_in(PG_FUNCTION_ARGS)
@@ -486,9 +436,7 @@ sparsevec_typmod_in(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(*tl);
 }
 
-/*
- * Convert external binary representation to internal representation
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_recv);
 Datum
 sparsevec_recv(PG_FUNCTION_ARGS)
@@ -517,7 +465,6 @@ sparsevec_recv(PG_FUNCTION_ARGS)
 	result = InitSparseVector(dim, nnz);
 	values = SPARSEVEC_VALUES(result);
 
-	/* Binary representation uses zero-based numbering for indices */
 	for (int i = 0; i < nnz; i++)
 	{
 		result->indices[i] = pq_getmsgint(buf, sizeof(int32));
@@ -538,9 +485,7 @@ sparsevec_recv(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-/*
- * Convert internal representation to the external binary representation
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_send);
 Datum
 sparsevec_send(PG_FUNCTION_ARGS)
@@ -554,7 +499,6 @@ sparsevec_send(PG_FUNCTION_ARGS)
 	pq_sendint(&buf, svec->nnz, sizeof(int32));
 	pq_sendint(&buf, svec->unused, sizeof(int32));
 
-	/* Binary representation uses zero-based numbering for indices */
 	for (int i = 0; i < svec->nnz; i++)
 		pq_sendint(&buf, svec->indices[i], sizeof(int32));
 
@@ -564,10 +508,7 @@ sparsevec_send(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
 }
 
-/*
- * Convert sparse vector to sparse vector
- * This is needed to check the type modifier
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec);
 Datum
 sparsevec(PG_FUNCTION_ARGS)
@@ -580,9 +521,7 @@ sparsevec(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(svec);
 }
 
-/*
- * Convert dense vector to sparse vector
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(vector_to_sparsevec);
 Datum
 vector_to_sparsevec(PG_FUNCTION_ARGS)
@@ -623,9 +562,7 @@ vector_to_sparsevec(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-/*
- * Convert half vector to sparse vector
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(halfvec_to_sparsevec);
 Datum
 halfvec_to_sparsevec(PG_FUNCTION_ARGS)
@@ -666,9 +603,7 @@ halfvec_to_sparsevec(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-/*
- * Convert array to sparse vector
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(array_to_sparsevec);
 Datum
 array_to_sparsevec(PG_FUNCTION_ARGS)
@@ -781,25 +716,20 @@ array_to_sparsevec(PG_FUNCTION_ARGS)
 #undef PROCESS_ARRAY_ELEM
 #undef IS_NOT_ZERO
 
-	/*
-	 * Free allocation from deconstruct_array. Do not free individual elements
-	 * when pass-by-reference since they point to original array.
-	 */
+
 	pfree(elemsp);
 
 	if (j != result->nnz)
 		elog(ERROR, "correctness check failed");
 
-	/* Check elements */
+
 	for (int i = 0; i < result->nnz; i++)
 		CheckElement(values[i]);
 
 	PG_RETURN_POINTER(result);
 }
 
-/*
- * Get the L2 squared distance between sparse vectors
- */
+
 static float
 SparsevecL2SquaredDistance(SparseVector * a, SparseVector * b)
 {
@@ -826,11 +756,9 @@ SparsevecL2SquaredDistance(SparseVector * a, SparseVector * b)
 			else if (ai > bi)
 				distance += bx[j] * bx[j];
 
-			/* Update start for next iteration */
 			if (ai >= bi)
 				bpos = j + 1;
 
-			/* Found or passed it */
 			if (bi >= ai)
 				break;
 		}
@@ -845,9 +773,7 @@ SparsevecL2SquaredDistance(SparseVector * a, SparseVector * b)
 	return distance;
 }
 
-/*
- * Get the L2 distance between sparse vectors
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_l2_distance);
 Datum
 sparsevec_l2_distance(PG_FUNCTION_ARGS)
@@ -860,10 +786,7 @@ sparsevec_l2_distance(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(sqrt((double) SparsevecL2SquaredDistance(a, b)));
 }
 
-/*
- * Get the L2 squared distance between sparse vectors
- * This saves a sqrt calculation
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_l2_squared_distance);
 Datum
 sparsevec_l2_squared_distance(PG_FUNCTION_ARGS)
@@ -876,9 +799,7 @@ sparsevec_l2_squared_distance(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8((double) SparsevecL2SquaredDistance(a, b));
 }
 
-/*
- * Get the inner product of two sparse vectors
- */
+
 static float
 SparsevecInnerProduct(SparseVector * a, SparseVector * b)
 {
@@ -895,15 +816,12 @@ SparsevecInnerProduct(SparseVector * a, SparseVector * b)
 		{
 			int			bi = b->indices[j];
 
-			/* Only update when the same index */
 			if (ai == bi)
 				distance += ax[i] * bx[j];
 
-			/* Update start for next iteration */
 			if (ai >= bi)
 				bpos = j + 1;
 
-			/* Found or passed it */
 			if (bi >= ai)
 				break;
 		}
@@ -912,9 +830,7 @@ SparsevecInnerProduct(SparseVector * a, SparseVector * b)
 	return distance;
 }
 
-/*
- * Get the inner product of two sparse vectors
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_inner_product);
 Datum
 sparsevec_inner_product(PG_FUNCTION_ARGS)
@@ -927,9 +843,7 @@ sparsevec_inner_product(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8((double) SparsevecInnerProduct(a, b));
 }
 
-/*
- * Get the negative inner product of two sparse vectors
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_negative_inner_product);
 Datum
 sparsevec_negative_inner_product(PG_FUNCTION_ARGS)
@@ -942,9 +856,7 @@ sparsevec_negative_inner_product(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8((double) -SparsevecInnerProduct(a, b));
 }
 
-/*
- * Get the cosine distance between two sparse vectors
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_cosine_distance);
 Datum
 sparsevec_cosine_distance(PG_FUNCTION_ARGS)
@@ -1054,9 +966,7 @@ sparsevec_l2_norm(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(sqrt(norm));
 }
 
-/*
- * Normalize a sparse vector with the L2 norm
- */
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(sparsevec_l2_normalize);
 Datum
 sparsevec_l2_normalize(PG_FUNCTION_ARGS)
@@ -1070,13 +980,11 @@ sparsevec_l2_normalize(PG_FUNCTION_ARGS)
 	result = InitSparseVector(a->dim, a->nnz);
 	rx = SPARSEVEC_VALUES(result);
 
-	/* Auto-vectorized */
 	for (int i = 0; i < a->nnz; i++)
 		norm += (double) ax[i] * (double) ax[i];
 
 	norm = sqrt(norm);
 
-	/* Return zero vector for zero norm */
 	if (norm > 0)
 	{
 		int			zeros = 0;
@@ -1093,7 +1001,6 @@ sparsevec_l2_normalize(PG_FUNCTION_ARGS)
 				zeros++;
 		}
 
-		/* Allocate a new vector in the unlikely event there are zeros */
 		if (zeros > 0)
 		{
 			SparseVector *newResult = InitSparseVector(result->dim, result->nnz - zeros);
@@ -1123,9 +1030,7 @@ sparsevec_l2_normalize(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-/*
- * Internal helper to compare sparse vectors
- */
+
 static int
 sparsevec_cmp_internal(SparseVector * a, SparseVector * b)
 {

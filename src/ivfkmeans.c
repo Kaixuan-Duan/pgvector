@@ -31,7 +31,6 @@ InitCenters(Relation index, VectorArray samples, VectorArray centers, float *low
 	procinfo = index_getprocinfo(index, 1, IVFFLAT_KMEANS_DISTANCE_PROC);
 	collation = index->rd_indcollation[0];
 
-	/* Choose an initial center uniformly at random */
 	VectorArraySet(centers, 0, VectorArrayGet(samples, RandomInt() % samples->length));
 	centers->length++;
 
@@ -52,8 +51,7 @@ InitCenters(Relation index, VectorArray samples, VectorArray centers, float *low
 			Datum		vec = PointerGetDatum(VectorArrayGet(samples, j));
 			double		distance;
 
-			/* Only need to compute distance for new center */
-			/* TODO Use triangle inequality to reduce distance calculations */
+
 			distance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, vec, PointerGetDatum(VectorArrayGet(centers, i))));
 
 			/* Set lower bound */
@@ -206,10 +204,8 @@ ComputeNewCenters(VectorArray samples, float *agg, VectorArray newCenters, int *
 		centerCounts[j] = 0;
 	}
 
-	/* Increment sum of closest center */
 	SumCenters(samples, agg, closestCenters, typeInfo);
 
-	/* Increment count of closest center */
 	for (int j = 0; j < numSamples; j++)
 		centerCounts[closestCenters[j]] += 1;
 
@@ -220,8 +216,7 @@ ComputeNewCenters(VectorArray samples, float *agg, VectorArray newCenters, int *
 
 		if (centerCounts[j] > 0)
 		{
-			/* Double avoids overflow, but requires more memory */
-			/* TODO Update bounds */
+
 			for (int k = 0; k < dimensions; k++)
 			{
 				if (isinf(x[k]))
@@ -233,7 +228,7 @@ ComputeNewCenters(VectorArray samples, float *agg, VectorArray newCenters, int *
 		}
 		else
 		{
-			/* TODO Handle empty centers properly */
+
 			for (int k = 0; k < dimensions; k++)
 				x[k] = RandomDouble();
 		}
@@ -338,7 +333,7 @@ ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const Ivff
 		/* Find closest center */
 		for (int64 k = 0; k < numCenters; k++)
 		{
-			/* TODO Use Lemma 1 in k-means++ initialization */
+
 			float		distance = lowerBound[j * numCenters + k];
 
 			if (distance < minDistance)
@@ -352,7 +347,6 @@ ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const Ivff
 		closestCenters[j] = closestCenter;
 	}
 
-	/* Give 500 iterations to converge */
 	for (int iteration = 0; iteration < 500; iteration++)
 	{
 		int			changes = 0;
@@ -375,7 +369,6 @@ ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const Ivff
 			}
 		}
 
-		/* For all centers c, compute s(c) */
 		for (int64 j = 0; j < numCenters; j++)
 		{
 			float		minDistance = FLT_MAX;

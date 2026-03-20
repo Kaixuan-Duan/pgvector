@@ -187,7 +187,7 @@ typedef struct HnswOptions
 	int			efConstruction; /* size of dynamic candidate list */
 
 
-	// todo dkx
+
 	/* new: two-graph build options; 0 means “not provided” */
 	int   m1;
 	int   efConstruction1;
