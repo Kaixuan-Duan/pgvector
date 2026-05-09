@@ -223,6 +223,9 @@ typedef struct HnswShared
 	Oid			heaprelid;
 	Oid			indexrelid;
 	bool		isconcurrent;
+	bool		multiBuild;
+	int			buildCol;
+	double		progressBase;
 
 	/* Worker progress */
 	ConditionVariable workersdonecv;
