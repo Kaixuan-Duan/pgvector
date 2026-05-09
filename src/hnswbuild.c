@@ -499,7 +499,21 @@ FlushPages(HnswBuildState * buildstate)
 	MemoryContextReset(buildstate->graphCtx);
 }
 
-// todo dkx ok
+static void
+FlushPagesColumn(HnswBuildState *buildstate, int col)
+{
+#ifdef HNSW_MEMORY
+	elog(INFO, "memory col%d: %zu MB", col + 1,
+		 buildstate->graph->memoryUsed / (1024 * 1024));
+#endif
+
+	CreateGraphPagesColumn(buildstate, col);
+	WriteNeighborTuples(buildstate);
+
+	buildstate->graph->flushed = true;
+	MemoryContextReset(buildstate->graphCtx);
+}
+
 static void
 FlushPagesMulti(HnswBuildStateMulti *mstate)
 {
@@ -694,7 +708,6 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 /*
  * Insert tuple
  */
-// todo dkx
 static bool
 InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate)
 {
@@ -929,6 +942,81 @@ InsertTupleMulti(Relation index, Datum *values, bool *isnull,
     return true;
 }
 
+static bool
+InsertTupleColumn(Relation index, Datum *values, bool *isnull,
+				  ItemPointer heaptid, HnswBuildState *buildstate, int col)
+{
+	HnswGraph  *graph = buildstate->graph;
+	HnswElement element;
+	HnswAllocator *allocator = &buildstate->allocator;
+	HnswSupport *support = &buildstate->support;
+	Size		valueSize;
+	Pointer		valuePtr;
+	LWLock	   *flushLock = &graph->flushLock;
+	char	   *base = buildstate->hnswarea;
+	Datum		value;
+
+	if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
+		return false;
+
+	valueSize = VARSIZE_ANY(DatumGetPointer(value));
+
+	LWLockAcquire(flushLock, LW_SHARED);
+
+	if (graph->flushed)
+	{
+		LWLockRelease(flushLock);
+		return HnswInsertTupleOnDiskMulti(index, support, value, heaptid, true, col);
+	}
+
+	LWLockAcquire(&graph->allocatorLock, LW_EXCLUSIVE);
+
+	if (graph->memoryUsed >= graph->memoryTotal)
+	{
+		LWLockRelease(&graph->allocatorLock);
+		LWLockRelease(flushLock);
+		LWLockAcquire(flushLock, LW_EXCLUSIVE);
+
+		if (!graph->flushed)
+		{
+			ereport(NOTICE,
+					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples",
+							(int64) graph->indtuples),
+					 errdetail("Building will take significantly more time."),
+					 errhint("Increase maintenance_work_mem to speed up builds.")));
+
+			FlushPagesColumn(buildstate, col);
+		}
+
+		LWLockRelease(flushLock);
+		return HnswInsertTupleOnDiskMulti(index, support, value, heaptid, true, col);
+	}
+
+	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml,
+							 buildstate->maxLevel, allocator);
+	valuePtr = HnswAlloc(allocator, valueSize);
+
+	LWLockRelease(&graph->allocatorLock);
+
+	memcpy(valuePtr, DatumGetPointer(value), valueSize);
+	HnswPtrStore(base, element->value, valuePtr);
+
+	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
+
+	InsertTupleInMemory(buildstate, element);
+
+	LWLockRelease(flushLock);
+
+	return true;
+}
+
+typedef struct HnswBuildColumnState
+{
+	HnswBuildState *buildstate;
+	int			col;
+	double		progressBase;
+} HnswBuildColumnState;
+
 
 /*
  * Callback for table_index_build_scan
@@ -958,6 +1046,38 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	}
 
 	/* Reset memory context */
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextReset(buildstate->tmpCtx);
+}
+
+static void
+BuildCallbackColumn(Relation index, ItemPointer tid, Datum *values,
+					bool *isnull, bool tupleIsAlive, void *state)
+{
+	HnswBuildColumnState *columnstate = (HnswBuildColumnState *) state;
+	HnswBuildState *buildstate = columnstate->buildstate;
+	HnswGraph  *graph = buildstate->graph;
+	MemoryContext oldCtx;
+	Datum		vals1[1];
+	bool		nulls1[1];
+
+	if (isnull[columnstate->col])
+		return;
+
+	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
+
+	vals1[0] = values[columnstate->col];
+	nulls1[0] = false;
+
+	if (InsertTupleColumn(index, vals1, nulls1, tid, buildstate, columnstate->col))
+	{
+		SpinLockAcquire(&graph->lock);
+		graph->indtuples++;
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+									  (int64) (columnstate->progressBase + graph->indtuples));
+		SpinLockRelease(&graph->lock);
+	}
+
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextReset(buildstate->tmpCtx);
 }
@@ -1140,6 +1260,74 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswarea = NULL;
 }
 
+static void
+InitBuildStateColumn(HnswBuildState *buildstate, Relation heap, Relation index,
+					 IndexInfo *indexInfo, ForkNumber forkNum, int col)
+{
+	MemSet(buildstate, 0, sizeof(HnswBuildState));
+
+	if (col < 0 || col >= indexInfo->ii_NumIndexKeyAttrs)
+		elog(ERROR, "hnsw build column out of range: col=%d nkeys=%d",
+			 col, indexInfo->ii_NumIndexKeyAttrs);
+
+	buildstate->heap = heap;
+	buildstate->index = index;
+	buildstate->indexInfo = indexInfo;
+	buildstate->forkNum = forkNum;
+	buildstate->typeInfo = HnswGetTypeInfoColumn(index, col);
+
+	buildstate->m = HnswGetMColumn(index, col);
+	buildstate->efConstruction = HnswGetEfConstructionColumn(index, col);
+	buildstate->dimensions = TupleDescAttr(index->rd_att, col)->atttypmod;
+
+	if (TupleDescAttr(index->rd_att, col)->atttypid == VARBITOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("type not supported for hnsw index")));
+
+	if (buildstate->dimensions < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("column does not have dimensions")));
+
+	if (buildstate->dimensions > buildstate->typeInfo->maxDimensions)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("column cannot have more than %d dimensions for hnsw index",
+						buildstate->typeInfo->maxDimensions)));
+
+	if (buildstate->efConstruction < 2 * buildstate->m)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ef_construction must be greater than or equal to 2 * m")));
+
+	buildstate->reltuples = 0;
+	buildstate->indtuples = 0;
+
+	HnswInitSupportColumn(&buildstate->support, index, col);
+
+	InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
+	buildstate->graph = &buildstate->graphData;
+	buildstate->ml = HnswGetMl(buildstate->m);
+	buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
+
+	buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
+												   "Hnsw build graph context",
+#if PG_VERSION_NUM >= 150000
+												   1024 * 1024, 1024 * 1024,
+#endif
+												   1024 * 1024);
+	buildstate->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
+											   "Hnsw build temporary context",
+											   ALLOCSET_DEFAULT_SIZES);
+
+	InitAllocator(&buildstate->allocator, &HnswMemoryContextAlloc, buildstate);
+
+	buildstate->hnswleader = NULL;
+	buildstate->hnswshared = NULL;
+	buildstate->hnswarea = NULL;
+}
+
 
 static void
 InitBuildStateMulti(HnswBuildStateMulti *buildstatemulti,
@@ -1158,70 +1346,8 @@ InitBuildStateMulti(HnswBuildStateMulti *buildstatemulti,
 	buildstatemulti->cols = (HnswBuildState *) palloc0(sizeof(HnswBuildState) * nkeys);
 
 	for (int col = 0; col < nkeys; col++)
-	{
-		HnswBuildState *buildstate = &buildstatemulti->cols[col];
-
-		buildstate->heap = heap;
-		buildstate->index = index;
-		buildstate->indexInfo = indexInfo;
-		buildstate->forkNum = forkNum;
-
-		buildstate->typeInfo = HnswGetTypeInfoColumn(index, col);
-
-		buildstate->m = HnswGetMColumn(index, col);
-		buildstate->efConstruction = HnswGetEfConstructionColumn(index, col);
-		buildstate->dimensions = TupleDescAttr(index->rd_att, col)->atttypmod;
-
-		/* Disallow varbit since require fixed dimensions */
-		if (TupleDescAttr(index->rd_att, col)->atttypid == VARBITOID)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("type not supported for hnsw index")));
-
-		/* Require column to have dimensions to be indexed */
-		if (buildstate->dimensions < 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("column does not have dimensions")));
-
-		if (buildstate->dimensions > buildstate->typeInfo->maxDimensions)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("column cannot have more than %d dimensions for hnsw index", buildstate->typeInfo->maxDimensions)));
-
-		if (buildstate->efConstruction < 2 * buildstate->m)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("ef_construction must be greater than or equal to 2 * m")));
-
-		buildstate->reltuples = 0;
-		buildstate->indtuples = 0;
-
-		/* Get support functions */
-		HnswInitSupportColumn(&buildstate->support, index, col);
-
-		InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
-		buildstate->graph = &buildstate->graphData;
-		buildstate->ml = HnswGetMl(buildstate->m);
-		buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
-
-		buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
-													   "Hnsw build graph context",
-	#if PG_VERSION_NUM >= 150000
-													   1024 * 1024, 1024 * 1024,
-	#endif
-													   1024 * 1024);
-		buildstate->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
-												   "Hnsw build temporary context",
-												   ALLOCSET_DEFAULT_SIZES);
-
-		InitAllocator(&buildstate->allocator, &HnswMemoryContextAlloc, buildstate);
-
-		buildstate->hnswleader = NULL;
-		buildstate->hnswshared = NULL;
-		buildstate->hnswarea = NULL;
-
-	}
+		InitBuildStateColumn(&buildstatemulti->cols[col], heap, index, indexInfo,
+							 forkNum, col);
 }
 
 /*
@@ -1281,15 +1407,32 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	/* Join parallel scan */
 	indexInfo = BuildIndexInfo(indexRel);
 	indexInfo->ii_Concurrent = hnswshared->isconcurrent;
-	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
+	if (hnswshared->multiBuild)
+		InitBuildStateColumn(&buildstate, heapRel, indexRel, indexInfo,
+							 MAIN_FORKNUM, hnswshared->buildCol);
+	else
+		InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
 	buildstate.graph = &hnswshared->graphData;
 	buildstate.hnswarea = hnswarea;
 	InitAllocator(&buildstate.allocator, &HnswSharedMemoryAlloc, &buildstate);
 	scan = table_beginscan_parallel(heapRel,
 									ParallelTableScanFromHnswShared(hnswshared));
-	reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
-									   true, progress, BuildCallback,
-									   (void *) &buildstate, scan);
+	if (hnswshared->multiBuild)
+	{
+		HnswBuildColumnState columnstate;
+
+		columnstate.buildstate = &buildstate;
+		columnstate.col = hnswshared->buildCol;
+		columnstate.progressBase = hnswshared->progressBase;
+
+		reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
+										   true, progress, BuildCallbackColumn,
+										   (void *) &columnstate, scan);
+	}
+	else
+		reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
+										   true, progress, BuildCallback,
+										   (void *) &buildstate, scan);
 
 	/* Record statistics */
 	SpinLockAcquire(&hnswshared->mutex);
@@ -1400,7 +1543,8 @@ HnswLeaderParticipateAsWorker(HnswBuildState * buildstate)
  * Begin parallel build
  */
 static void
-HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
+HnswBeginParallelInternal(HnswBuildState * buildstate, bool isconcurrent, int request,
+						  bool multiBuild, int buildCol, double progressBase)
 {
 	ParallelContext *pcxt;
 	Snapshot	snapshot;
@@ -1472,6 +1616,9 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	hnswshared->heaprelid = RelationGetRelid(buildstate->heap);
 	hnswshared->indexrelid = RelationGetRelid(buildstate->index);
 	hnswshared->isconcurrent = isconcurrent;
+	hnswshared->multiBuild = multiBuild;
+	hnswshared->buildCol = buildCol;
+	hnswshared->progressBase = progressBase;
 	ConditionVariableInit(&hnswshared->workersdonecv);
 	SpinLockInit(&hnswshared->mutex);
 	/* Initialize mutable state */
@@ -1537,6 +1684,20 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	WaitForParallelWorkersToAttach(pcxt);
 }
 
+static void
+HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
+{
+	HnswBeginParallelInternal(buildstate, isconcurrent, request, false, 0, 0);
+}
+
+static void
+HnswBeginParallelColumn(HnswBuildState * buildstate, bool isconcurrent, int request,
+						int buildCol, double progressBase)
+{
+	HnswBeginParallelInternal(buildstate, isconcurrent, request, true,
+							  buildCol, progressBase);
+}
+
 /*
  * Compute parallel workers
  */
@@ -1600,68 +1761,69 @@ BuildGraph(HnswBuildState * buildstate, ForkNumber forkNum)
 static void
 BuildGraphMulti(HnswBuildStateMulti * buildstatemulti, ForkNumber forkNum)
 {
-	int parallel_workers = 0;
+	double		progressBase = 0;
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
 								 PROGRESS_HNSW_PHASE_LOAD);
 
-	/* Calculate parallel workers (先保留计算，但本版本不启并行) */
-	if (buildstatemulti->heap != NULL)
-		parallel_workers = ComputeParallelWorkers(buildstatemulti->heap,
-												  buildstatemulti->index);
+	/* Create the multi-column metapage once. Each column updates its slot. */
+	CreateMetaPageMulti(buildstatemulti);
 
-	/* Add tuples to graphs (只扫描一次 heap) */
-	if (buildstatemulti->heap != NULL)
-	{
-		double reltuples;
-
-		reltuples = table_index_build_scan(buildstatemulti->heap,
-										   buildstatemulti->index,
-										   buildstatemulti->indexInfo,
-										   true, true,
-										   BuildCallbackMulti,
-										   (void *) buildstatemulti,
-										   NULL);
-
-		/* reltuples 只记一次，避免两列时统计翻倍 */
-		buildstatemulti->cols[0].reltuples = reltuples;
-		for (int col = 1; col < buildstatemulti->nkeys; col++)
-			buildstatemulti->cols[col].reltuples = 0;
-
-		/* 每列 indtuples 从各自图里取 */
-		for (int col = 0; col < buildstatemulti->nkeys; col++)
-			buildstatemulti->cols[col].indtuples =
-				buildstatemulti->cols[col].graph->indtuples;
-	}
-
-	// /* Flush pages：每列的图都需要 flush */
-	// for (int col = 0; col < buildstatemulti->nkeys; col++)
-	// {
-	// 	HnswBuildState *bs = &buildstatemulti->cols[col];
-	//
-	// 	if (bs->graph != NULL && !bs->graph->flushed)
-	// 		FlushPages(bs);
-	// }
-	/* Flush pages：任意一列没 flushed，就统一 flush multi */
-	bool need_flush = false;
 	for (int col = 0; col < buildstatemulti->nkeys; col++)
 	{
-		HnswBuildState *bs = &buildstatemulti->cols[col];
+		HnswBuildState *buildstate = &buildstatemulti->cols[col];
+		int			parallel_workers = 0;
 
-		if (bs->graph != NULL && !bs->graph->flushed)
+		if (buildstatemulti->heap != NULL)
+			parallel_workers = ComputeParallelWorkers(buildstatemulti->heap,
+													  buildstatemulti->index);
+
+		if (parallel_workers > 0)
+			HnswBeginParallelColumn(buildstate, buildstate->indexInfo->ii_Concurrent,
+									parallel_workers, col, progressBase);
+
+		if (buildstatemulti->heap != NULL)
 		{
-			need_flush = true;
-			break;
-		}
-	}
-	if (need_flush)
-		FlushPagesMulti(buildstatemulti);
+			double		reltuples;
 
-	/* Parallel build：本最小版本先不启并行，所以这里不做 HnswEndParallel
-	* 它们只是为了消除编译器警告（“变量已定义但未使用”）。
-	* 如果你后面不用 parallel_workers / forkNum，要么保留这两行，要么直接删掉这两个变量/参数的使用痕迹（例如把 parallel_workers 变量也删掉）。功能上没有任何影响。
-	*/
-	(void) parallel_workers;
+			if (buildstate->hnswleader)
+				reltuples = ParallelHeapScan(buildstate);
+			else
+			{
+				HnswBuildColumnState columnstate;
+
+				columnstate.buildstate = buildstate;
+				columnstate.col = col;
+				columnstate.progressBase = progressBase;
+
+				reltuples = table_index_build_scan(buildstatemulti->heap,
+												   buildstatemulti->index,
+												   buildstatemulti->indexInfo,
+												   true, true,
+												   BuildCallbackColumn,
+												   (void *) &columnstate,
+												   NULL);
+			}
+
+			buildstate->reltuples = (col == 0) ? reltuples : 0;
+		}
+
+		buildstate->indtuples = buildstate->graph->indtuples;
+
+		if (!buildstate->graph->flushed)
+			FlushPagesColumn(buildstate, col);
+
+		buildstate->indtuples = buildstate->graph->indtuples;
+
+		if (buildstate->hnswleader)
+		{
+			HnswEndParallel(buildstate->hnswleader);
+			buildstate->hnswleader = NULL;
+		}
+
+		progressBase += buildstate->indtuples;
+	}
+
 	(void) forkNum;
 }
 /*
@@ -1693,9 +1855,9 @@ BuildIndexMulti(Relation heap, Relation index, IndexInfo *indexInfo,
 	SeedRandom(42);
 #endif
 
-	InitBuildStateMulti(buildstatemulti, heap, index, indexInfo, forkNum); // todo dkx
+	InitBuildStateMulti(buildstatemulti, heap, index, indexInfo, forkNum);
 
-	BuildGraphMulti(buildstatemulti, forkNum); // todo dkx
+	BuildGraphMulti(buildstatemulti, forkNum); 
 
 	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
 		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
@@ -1740,9 +1902,9 @@ IndexBuildResult *
 hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	IndexBuildResult *result;
-	HnswBuildStateMulti buildstatemulti;           // todo dkx
+	HnswBuildStateMulti buildstatemulti;           
 
-	BuildIndexMulti(heap, index, indexInfo, &buildstatemulti, MAIN_FORKNUM); // todo dkx
+	BuildIndexMulti(heap, index, indexInfo, &buildstatemulti, MAIN_FORKNUM); 
 
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));	// 构建完成后，填充返回结果
