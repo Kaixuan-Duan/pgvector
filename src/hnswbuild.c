@@ -1608,6 +1608,9 @@ HnswBeginParallelInternal(HnswBuildState * buildstate, bool isconcurrent, int re
 
 	/* Launch workers, saving status for leader/caller */
 	LaunchParallelWorkers(pcxt);
+	ereport(NOTICE,
+			(errmsg("hydex hnsw requested %d parallel workers, launched %d",
+					request, pcxt->nworkers_launched)));
 	hnswleader->pcxt = pcxt;
 	hnswleader->nparticipanttuplesorts = pcxt->nworkers_launched;
 	if (leaderparticipates)
@@ -1729,6 +1732,10 @@ BuildGraphMulti(HnswBuildStateMulti * buildstatemulti, ForkNumber forkNum)
 		if (buildstatemulti->heap != NULL)
 			parallel_workers = ComputeParallelWorkers(buildstatemulti->heap,
 													  buildstatemulti->index);
+
+		ereport(NOTICE,
+				(errmsg("hydex hnsw multi build col %d computed parallel_workers=%d",
+						col, parallel_workers)));
 
 		if (parallel_workers > 0)
 			HnswBeginParallelColumn(buildstate, buildstate->indexInfo->ii_Concurrent,
