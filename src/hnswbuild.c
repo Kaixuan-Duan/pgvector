@@ -102,6 +102,106 @@ CreateMetaPage(HnswBuildState * buildstate)
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
+/* todo dkx 不可删  关键点：buildstate 只是提供要写进去的值；覆盖发生是因为写目标（metapage block）是同一个。
+ * buf = HnswNewBuffer(index, forkNum);
+ * 这会在 index 文件里分配一个新 page（block）并返回 buffer
+ * 对于 HNSW 来说，第一次分配的 page 就是 metapage（通常就是 block 0 / HNSW_METAPAGE_BLKNO）
+ * 如果你在一个索引构建里调用两次 CreateMetaPage(bs)
+ * 第一次：分配了 block0，并写入 col0 的 meta
+ * 第二次：仍然会写 metapage block0（因为你的实现就是“写 metapage”，它没有“为第二列开一个新的 metapage block”的概念）
+ */
+static void
+CreateMetaPageMulti(HnswBuildStateMulti *mstate)
+{
+    Relation    index = mstate->index;
+    ForkNumber  forkNum = mstate->forkNum;
+    Buffer      buf;
+    Page        page;
+
+    buf = HnswNewBuffer(index, forkNum);
+    page = BufferGetPage(buf);
+    HnswInitPage(buf, page);
+
+    /* nkeys 只允许 1 或 2（因为你 multi 结构 graphs[2] 写死了） */
+    if (mstate->nkeys == 1)
+    {
+        /* ---- 写旧单列 metapage（完全复用原 CreateMetaPage 逻辑） ---- */
+        HnswBuildState *bs0 = &mstate->cols[0];
+        HnswMetaPage    metap = HnswPageGetMeta(page);
+
+        metap->magicNumber    = HNSW_MAGIC_NUMBER;
+        metap->version        = HNSW_VERSION;
+        metap->dimensions     = bs0->dimensions;
+        metap->m              = bs0->m;
+        metap->efConstruction = bs0->efConstruction;
+        metap->entryBlkno     = InvalidBlockNumber;
+        metap->entryOffno     = InvalidOffsetNumber;
+        metap->entryLevel     = -1;
+        metap->insertPage     = InvalidBlockNumber;
+
+        ((PageHeader) page)->pd_lower =
+            ((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
+
+        MarkBufferDirty(buf);
+        UnlockReleaseBuffer(buf);
+        return;
+    }
+    else if (mstate->nkeys == 2)
+    {
+        /* ---- 写新多列 metapage ---- */
+        HnswMetaPageMulti meta = HnswPageGetMetaMulti(page);
+
+        meta->magicNumber = HNSW_MAGIC_NUMBER;
+        meta->version     = HNSW_VERSION_MULTI;
+        meta->numGraphs   = 2;
+        meta->reserved    = 0;
+
+        /* graph 0 */
+        {
+            HnswBuildState   *bs = &mstate->cols[0];
+            HnswMetaPageData *g  = &meta->graphs[0];
+
+        	g->magicNumber    = HNSW_MAGIC_NUMBER;  /* 冗余字段，但写上更清晰 */
+        	g->version        = HNSW_VERSION;       /* 建议用“单列版本号”，表示每个 graph 槽位复用旧结构 */
+            g->dimensions     = bs->dimensions;
+            g->m              = bs->m;
+            g->efConstruction = bs->efConstruction;
+            g->entryBlkno     = InvalidBlockNumber;
+            g->entryOffno     = InvalidOffsetNumber;
+            g->entryLevel     = -1;
+            g->insertPage     = InvalidBlockNumber;
+        }
+
+        /* graph 1 */
+        {
+            HnswBuildState   *bs = &mstate->cols[1];
+            HnswMetaPageData *g  = &meta->graphs[1];
+
+        	g->magicNumber    = HNSW_MAGIC_NUMBER;  /* 冗余字段，但写上更清晰 */
+        	g->version        = HNSW_VERSION;       /* 建议用“单列版本号”，表示每个 graph 槽位复用旧结构 */
+            g->dimensions     = bs->dimensions;
+            g->m              = bs->m;
+            g->efConstruction = bs->efConstruction;
+            g->entryBlkno     = InvalidBlockNumber;
+            g->entryOffno     = InvalidOffsetNumber;
+            g->entryLevel     = -1;
+            g->insertPage     = InvalidBlockNumber;
+        }
+
+        ((PageHeader) page)->pd_lower =
+            ((char *) meta + sizeof(HnswMetaPageDataMulti)) - (char *) page;
+
+        MarkBufferDirty(buf);
+        UnlockReleaseBuffer(buf);
+        return;
+    }
+
+    /* 其它情况：直接不支持 */
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("hnsw multi metapage only supports 1 or 2 index columns (got %d)", mstate->nkeys)));
+}
+
 
 /*
  * Add a new page
@@ -234,6 +334,103 @@ CreateGraphPages(HnswBuildState * buildstate)
 	pfree(ntup);
 }
 
+static void
+CreateGraphPagesColumn(HnswBuildState *buildstate, int col)
+{
+    Relation     index = buildstate->index;
+    ForkNumber   forkNum = buildstate->forkNum;
+    Size         maxSize;
+    HnswElementTuple etup;
+    HnswNeighborTuple ntup;
+    BlockNumber  insertPage;
+    HnswElement  entryPoint;
+    Buffer       buf;
+    Page         page;
+    HnswElementPtr iter = buildstate->graph->head;
+    char        *base = buildstate->hnswarea;
+
+    maxSize = HNSW_MAX_SIZE;
+
+    etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+    ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+
+    buf = HnswNewBuffer(index, forkNum);
+    page = BufferGetPage(buf);
+    HnswInitPage(buf, page);
+
+    while (!HnswPtrIsNull(base, iter))
+    {
+        HnswElement element = HnswPtrAccess(base, iter);
+        Size        etupSize;
+        Size        ntupSize;
+        Size        combinedSize;
+        Pointer     valuePtr = HnswPtrAccess(base, element->value);
+
+        iter = element->next;
+
+        MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
+
+        etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+        ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+        combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+
+        if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("index tuple too large")));
+
+        HnswSetElementTuple(base, etup, element);
+
+        if (PageGetFreeSpace(page) < etupSize ||
+            (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
+            HnswBuildAppendPage(index, &buf, &page, forkNum);
+
+        element->blkno = BufferGetBlockNumber(buf);
+        element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
+        if (combinedSize <= maxSize)
+        {
+            element->neighborPage  = element->blkno;
+            element->neighborOffno = OffsetNumberNext(element->offno);
+        }
+        else
+        {
+            element->neighborPage  = element->blkno + 1;
+            element->neighborOffno = FirstOffsetNumber;
+        }
+
+        ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
+
+        if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+            elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+        if (PageGetFreeSpace(page) < ntupSize)
+            HnswBuildAppendPage(index, &buf, &page, forkNum);
+
+        if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+            elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+    }
+
+    insertPage = BufferGetBlockNumber(buf);
+
+    MarkBufferDirty(buf);
+    UnlockReleaseBuffer(buf);
+
+    entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
+
+    /*
+     * 关键改动：单列用 HnswUpdateMetaPage；多列必须写到 metapage 的 graphs[col]
+     * 你需要实现这个函数（或改造旧函数支持 col）
+     */
+    HnswUpdateMetaPageMulti(index, col,
+                            HNSW_UPDATE_ENTRY_ALWAYS,
+                            entryPoint, insertPage,
+                            forkNum, true);
+
+    pfree(etup);
+    pfree(ntup);
+}
+
+
 /*
  * Write neighbor tuples
  */
@@ -301,6 +498,34 @@ FlushPages(HnswBuildState * buildstate)
 	buildstate->graph->flushed = true;
 	MemoryContextReset(buildstate->graphCtx);
 }
+
+// todo dkx ok
+static void
+FlushPagesMulti(HnswBuildStateMulti *mstate)
+{
+#ifdef HNSW_MEMORY
+    for (int col = 0; col < mstate->nkeys; col++)
+        elog(INFO, "memory col%d: %zu MB",
+             col + 1, mstate->cols[col].graph->memoryUsed / (1024 * 1024));
+#endif
+
+    /* 关键：写 metapage（旧/新布局由 nkeys 决定） */
+    CreateMetaPageMulti(mstate);
+
+    /* 每列各自落盘自己的图结构 */
+    for (int col = 0; col < mstate->nkeys; col++)
+    {
+        HnswBuildState *bs = &mstate->cols[col];
+
+        // CreateGraphPages(bs);
+    	CreateGraphPagesColumn(bs, col);
+        WriteNeighborTuples(bs);
+
+        bs->graph->flushed = true;
+        MemoryContextReset(bs->graphCtx);
+    }
+}
+
 
 /*
  * Add a heap TID to an existing element
@@ -469,6 +694,7 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 /*
  * Insert tuple
  */
+// todo dkx
 static bool
 InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate)
 {
@@ -559,6 +785,151 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	return true;
 }
 
+
+static inline bool
+HnswUseMultiLayout(Relation index, HnswBuildStateMulti *mstate)
+{
+    /* 最小判定：nkeys>1 => 新布局；否则旧布局 */
+    int nkeys = (mstate != NULL) ? mstate->nkeys : IndexRelationGetNumberOfKeyAttributes(index);
+    return (nkeys > 1);
+}
+
+/*
+ * 统一入口：兼容旧布局(单列) + 新布局(多列)
+ * - 单列调用：InsertTupleMulti(index, values, isnull, tid, buildstate, NULL, 0)
+ * - 多列调用：InsertTupleMulti(index, vals1, nulls1, tid, &mstate->cols[col], mstate, col)
+ */
+static bool
+InsertTupleMulti(Relation index, Datum *values, bool *isnull,
+                 ItemPointer heaptid, HnswBuildState *buildstate,
+                 HnswBuildStateMulti *mstate, int col)
+{
+    HnswGraph      *graph = buildstate->graph;
+    HnswElement     element;
+    HnswAllocator  *allocator = &buildstate->allocator;
+    HnswSupport    *support = &buildstate->support;
+    Size            valueSize;
+    Pointer         valuePtr;
+    LWLock         *flushLock = &graph->flushLock;
+    char           *base = buildstate->hnswarea;
+    Datum           value;
+    bool            multi = HnswUseMultiLayout(index, mstate);
+
+    /* Form index value */
+    if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
+        return false;
+
+    /* Get datum size */
+    valueSize = VARSIZE_ANY(DatumGetPointer(value));
+
+    /* Ensure graph not flushed when inserting */
+    LWLockAcquire(flushLock, LW_SHARED);
+
+    /* Are we in the on-disk phase? */
+    if (graph->flushed)
+    {
+        LWLockRelease(flushLock);
+
+        if (multi)
+            return HnswInsertTupleOnDiskMulti(index, support, value, heaptid, true, col);
+        else
+            return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+    }
+
+    /* Coordinate allocator (same as original) */
+    LWLockAcquire(&graph->allocatorLock, LW_EXCLUSIVE);
+
+    /* Memory check (same trigger point as original) */
+    if (graph->memoryUsed >= graph->memoryTotal)
+    {
+        LWLockRelease(&graph->allocatorLock);
+
+        LWLockRelease(flushLock);
+
+        if (multi)
+        {
+            /*
+             * 多列：最小做法是“一旦任意列超内存，就刷盘整个 multi”，
+             * 保证所有列同时进入 on-disk phase，避免布局/状态不一致。
+             *
+             * 这里建议拿一个“全局/统一”的 flush 同步锁来包住 FlushPagesMulti，
+             * 但你当前版本不启并行的话，最小实现也可以先不引入额外锁。
+             *
+             * 为了尽量接近原版语义，这里仍然拿回当前列的 flushLock(EXCLUSIVE)
+             * 再 flush，防止同列并发（即使你现在没并行）。
+             */
+            LWLockAcquire(flushLock, LW_EXCLUSIVE);
+
+            if (!graph->flushed)
+            {
+                ereport(NOTICE,
+                        (errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples",
+                                (int64) graph->indtuples),
+                         errdetail("Building will take significantly more time."),
+                         errhint("Increase maintenance_work_mem to speed up builds.")));
+
+                /*
+                 * 关键变化：不要 FlushPages(buildstate)（单列刷盘会破坏多列布局）
+                 * 改为 FlushPagesMulti(mstate)
+                 */
+                if (mstate == NULL)
+                    elog(ERROR, "multi layout requires buildstatemulti state");
+
+                FlushPagesMulti(mstate);
+            }
+
+            LWLockRelease(flushLock);
+
+            /* flush 后必然走 on-disk insert（新布局要带 col） */
+            return HnswInsertTupleOnDiskMulti(index, support, value, heaptid, true, col);
+        }
+        else
+        {
+            /* 旧布局：保持原行为 */
+            LWLockAcquire(flushLock, LW_EXCLUSIVE);
+
+            if (!graph->flushed)
+            {
+                ereport(NOTICE,
+                        (errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples",
+                                (int64) graph->indtuples),
+                         errdetail("Building will take significantly more time."),
+                         errhint("Increase maintenance_work_mem to speed up builds.")));
+
+                FlushPages(buildstate);
+            }
+
+            LWLockRelease(flushLock);
+
+            return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+        }
+    }
+
+    /* Ok, we can proceed to allocate the element (same as original) */
+    element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml,
+                             buildstate->maxLevel, allocator);
+    valuePtr = HnswAlloc(allocator, valueSize);
+
+    /* Done allocating; release allocator lock */
+    LWLockRelease(&graph->allocatorLock);
+
+    /* Copy the datum */
+    memcpy(valuePtr, DatumGetPointer(value), valueSize);
+    HnswPtrStore(base, element->value, valuePtr);
+
+    /* Create a lock for the element */
+    LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
+
+    /* Insert tuple in-memory */
+    InsertTupleInMemory(buildstate, element);
+
+    /* Release flush lock */
+    LWLockRelease(flushLock);
+
+    return true;
+}
+
+
 /*
  * Callback for table_index_build_scan
  */
@@ -591,9 +962,62 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	MemoryContextReset(buildstate->tmpCtx);
 }
 
+static void
+BuildCallbackMulti(Relation index, ItemPointer tid, Datum *values,
+				   bool *isnull, bool tupleIsAlive, void *state)
+{
+	HnswBuildStateMulti *mstate = (HnswBuildStateMulti *) state;
+
+	for (int col = 0; col < mstate->nkeys; col++)
+	{
+		HnswBuildState *buildstate = &mstate->cols[col];
+		HnswGraph      *graph = buildstate->graph;
+		MemoryContext   oldCtx;
+
+		/* Skip nulls for this column */
+		if (isnull[col])
+			continue;
+
+		/* Use this column's temp memory context */
+		oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
+
+		/*
+		 * 最小侵入：构造单列数组，让 InsertTuple 继续按 isnull[0]/values[0] 工作
+		 * 注意：InsertTuple 内部如果还会用到其它列（比如 values[1]），那它本来就不该这样写；
+		 * pgvector 单列版一般只看第 0 个，所以这里是兼容的。
+		 */
+		Datum vals1[1];
+		bool  nulls1[1];
+
+		vals1[0] = values[col];
+		nulls1[0] = false;
+
+		if (InsertTupleMulti(index, vals1, nulls1, tid, buildstate, mstate, col))
+		{
+			/* Update progress: each successful insert increments this graph's indtuples */
+			SpinLockAcquire(&graph->lock);
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
+			// BuildCallbackMulti 的 进度更新有 bug（会倒退）
+			/* 值单调递增没问题。
+			 * 但你现在是两张图各自维护 graph->indtuples。假设：
+			 * 图0 已经 10000
+			 * 图1 才 5
+			 * 当图1插入一次，你会把 PROGRESS_CREATEIDX_TUPLES_DONE 更新成 6，从 10000 倒退到 6。
+			 */
+			SpinLockRelease(&graph->lock);
+		}
+
+		/* Reset this column's temp context */
+		MemoryContextSwitchTo(oldCtx);
+		MemoryContextReset(buildstate->tmpCtx);
+	}
+}
+
+
 /*
  * Initialize the graph
  */
+// todo dkx
 static void
 InitGraph(HnswGraph * graph, char *base, Size memoryTotal)
 {
@@ -714,6 +1138,90 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->hnswleader = NULL;
 	buildstate->hnswshared = NULL;
 	buildstate->hnswarea = NULL;
+}
+
+
+static void
+InitBuildStateMulti(HnswBuildStateMulti *buildstatemulti,
+                    Relation heap, Relation index, IndexInfo *indexInfo, ForkNumber forkNum) // ok
+{
+	int nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	/* 填 multi wrapper */
+	buildstatemulti->heap = heap;
+	buildstatemulti->index = index;
+	buildstatemulti->indexInfo = indexInfo;
+	buildstatemulti->forkNum = forkNum;
+	buildstatemulti->nkeys = nkeys;
+
+	/* 为每个 key 列分配一个“原版 HnswBuildState” */
+	buildstatemulti->cols = (HnswBuildState *) palloc0(sizeof(HnswBuildState) * nkeys);
+
+	for (int col = 0; col < nkeys; col++)
+	{
+		HnswBuildState *buildstate = &buildstatemulti->cols[col];
+
+		buildstate->heap = heap;
+		buildstate->index = index;
+		buildstate->indexInfo = indexInfo;
+		buildstate->forkNum = forkNum;
+
+		buildstate->typeInfo = HnswGetTypeInfoColumn(index, col);
+
+		buildstate->m = HnswGetMColumn(index, col);
+		buildstate->efConstruction = HnswGetEfConstructionColumn(index, col);
+		buildstate->dimensions = TupleDescAttr(index->rd_att, col)->atttypmod;
+
+		/* Disallow varbit since require fixed dimensions */
+		if (TupleDescAttr(index->rd_att, col)->atttypid == VARBITOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("type not supported for hnsw index")));
+
+		/* Require column to have dimensions to be indexed */
+		if (buildstate->dimensions < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("column does not have dimensions")));
+
+		if (buildstate->dimensions > buildstate->typeInfo->maxDimensions)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("column cannot have more than %d dimensions for hnsw index", buildstate->typeInfo->maxDimensions)));
+
+		if (buildstate->efConstruction < 2 * buildstate->m)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("ef_construction must be greater than or equal to 2 * m")));
+
+		buildstate->reltuples = 0;
+		buildstate->indtuples = 0;
+
+		/* Get support functions */
+		HnswInitSupportColumn(&buildstate->support, index, col);
+
+		InitGraph(&buildstate->graphData, NULL, (Size) maintenance_work_mem * 1024L);
+		buildstate->graph = &buildstate->graphData;
+		buildstate->ml = HnswGetMl(buildstate->m);
+		buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
+
+		buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
+													   "Hnsw build graph context",
+	#if PG_VERSION_NUM >= 150000
+													   1024 * 1024, 1024 * 1024,
+	#endif
+													   1024 * 1024);
+		buildstate->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
+												   "Hnsw build temporary context",
+												   ALLOCSET_DEFAULT_SIZES);
+
+		InitAllocator(&buildstate->allocator, &HnswMemoryContextAlloc, buildstate);
+
+		buildstate->hnswleader = NULL;
+		buildstate->hnswshared = NULL;
+		buildstate->hnswarea = NULL;
+
+	}
 }
 
 /*
@@ -1089,6 +1597,73 @@ BuildGraph(HnswBuildState * buildstate, ForkNumber forkNum)
 		HnswEndParallel(buildstate->hnswleader);
 }
 
+static void
+BuildGraphMulti(HnswBuildStateMulti * buildstatemulti, ForkNumber forkNum)
+{
+	int parallel_workers = 0;
+
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+								 PROGRESS_HNSW_PHASE_LOAD);
+
+	/* Calculate parallel workers (先保留计算，但本版本不启并行) */
+	if (buildstatemulti->heap != NULL)
+		parallel_workers = ComputeParallelWorkers(buildstatemulti->heap,
+												  buildstatemulti->index);
+
+	/* Add tuples to graphs (只扫描一次 heap) */
+	if (buildstatemulti->heap != NULL)
+	{
+		double reltuples;
+
+		reltuples = table_index_build_scan(buildstatemulti->heap,
+										   buildstatemulti->index,
+										   buildstatemulti->indexInfo,
+										   true, true,
+										   BuildCallbackMulti,
+										   (void *) buildstatemulti,
+										   NULL);
+
+		/* reltuples 只记一次，避免两列时统计翻倍 */
+		buildstatemulti->cols[0].reltuples = reltuples;
+		for (int col = 1; col < buildstatemulti->nkeys; col++)
+			buildstatemulti->cols[col].reltuples = 0;
+
+		/* 每列 indtuples 从各自图里取 */
+		for (int col = 0; col < buildstatemulti->nkeys; col++)
+			buildstatemulti->cols[col].indtuples =
+				buildstatemulti->cols[col].graph->indtuples;
+	}
+
+	// /* Flush pages：每列的图都需要 flush */
+	// for (int col = 0; col < buildstatemulti->nkeys; col++)
+	// {
+	// 	HnswBuildState *bs = &buildstatemulti->cols[col];
+	//
+	// 	if (bs->graph != NULL && !bs->graph->flushed)
+	// 		FlushPages(bs);
+	// }
+	/* Flush pages：任意一列没 flushed，就统一 flush multi */
+	bool need_flush = false;
+	for (int col = 0; col < buildstatemulti->nkeys; col++)
+	{
+		HnswBuildState *bs = &buildstatemulti->cols[col];
+
+		if (bs->graph != NULL && !bs->graph->flushed)
+		{
+			need_flush = true;
+			break;
+		}
+	}
+	if (need_flush)
+		FlushPagesMulti(buildstatemulti);
+
+	/* Parallel build：本最小版本先不启并行，所以这里不做 HnswEndParallel
+	* 它们只是为了消除编译器警告（“变量已定义但未使用”）。
+	* 如果你后面不用 parallel_workers / forkNum，要么保留这两行，要么直接删掉这两个变量/参数的使用痕迹（例如把 parallel_workers 变量也删掉）。功能上没有任何影响。
+	*/
+	(void) parallel_workers;
+	(void) forkNum;
+}
 /*
  * Build the index
  */
@@ -1110,6 +1685,25 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	FreeBuildState(buildstate);
 }
 
+static void
+BuildIndexMulti(Relation heap, Relation index, IndexInfo *indexInfo,
+		   HnswBuildStateMulti * buildstatemulti, ForkNumber forkNum)
+{
+#ifdef HNSW_MEMORY
+	SeedRandom(42);
+#endif
+
+	InitBuildStateMulti(buildstatemulti, heap, index, indexInfo, forkNum); // todo dkx
+
+	BuildGraphMulti(buildstatemulti, forkNum); // todo dkx
+
+	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
+		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
+
+	for (int i = 0; i < buildstatemulti->nkeys; i++)
+		FreeBuildState(&buildstatemulti->cols[i]);
+
+}
 /*
  * Build the index for a logged table
  */
@@ -1128,9 +1722,57 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	return result;
 }
 
+/* Relation heap
+ * 被索引的 表
+ * 对应 test1
+ * 你从它扫描每一行，取 emb1 / emb2
+ */
+
+/* Relation index
+ * 正在构建的 索引 relation
+ * 对应 idx_chinese_emb_hnsw_ip
+ * 包含: index tuple layout
+ *		opclass
+ *		indcollation
+ *		rd_options（WITH 里的参数）
+ */
+IndexBuildResult *
+hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo)
+{
+	IndexBuildResult *result;
+	HnswBuildStateMulti buildstatemulti;           // todo dkx
+
+	BuildIndexMulti(heap, index, indexInfo, &buildstatemulti, MAIN_FORKNUM); // todo dkx
+
+
+	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));	// 构建完成后，填充返回结果
+	result->heap_tuples = buildstatemulti.cols[0].reltuples;
+	/* 实际插入了多少索引条目：两张图分别插入，求和 */
+	result->index_tuples = 0;
+	for (int col = 0; col < buildstatemulti.nkeys; col++)
+		result->index_tuples += buildstatemulti.cols[col].indtuples;
+
+	return result;
+}
+
+IndexBuildResult *
+hnswbuild_dispatch(Relation heap, Relation index, IndexInfo *indexInfo)
+{
+	int nkeys;
+
+	/* 以 key attrs 为准（不把 INCLUDE 算进去） */
+	nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	if (nkeys <= 1)
+		return hnswbuild(heap, index, indexInfo);
+	else
+		return hnswbuildmulti(heap, index, indexInfo);
+}
+
 /*
  * Build the index for an unlogged table
  */
+// todo dkx
 void
 hnswbuildempty(Relation index)
 {
@@ -1138,4 +1780,34 @@ hnswbuildempty(Relation index)
 	HnswBuildState buildstate;
 
 	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM);
+}
+
+/*
+ * Build the index for an unlogged table (multi-column)
+ */
+void
+hnswbuildemptymulti(Relation index)
+{
+	IndexInfo *indexInfo = BuildIndexInfo(index);
+	HnswBuildStateMulti buildstatemulti;
+
+	MemSet(&buildstatemulti, 0, sizeof(buildstatemulti));
+
+	/* heap == NULL, INIT_FORKNUM: initialize empty index structure */
+	BuildIndexMulti(NULL, index, indexInfo, &buildstatemulti, INIT_FORKNUM);
+
+	/* 注意：BuildIndexMulti 里需要负责释放 buildstatemulti->cols 数组本身 */
+}
+
+
+void
+hnswbuildempty_dispatch(Relation index)
+{
+	IndexInfo *indexInfo = BuildIndexInfo(index);
+	int nkeys = indexInfo->ii_NumIndexKeyAttrs;
+
+	if (nkeys <= 1)
+		hnswbuildempty(index);       /* 原版函数：保持不改名 */
+	else
+		hnswbuildemptymulti(index);  /* 新增 multi */
 }

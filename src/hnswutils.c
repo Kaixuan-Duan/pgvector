@@ -114,6 +114,26 @@ HnswGetM(Relation index)
 	return HNSW_DEFAULT_M;
 }
 
+int
+HnswGetMColumn(Relation index, int col)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+	{
+		/* === 两列最小支持：如果你已经在 HnswOptions 里加了 m1/m2 === */
+		/* 注：字段名以你实际为准；没加这些字段就删掉这段分支 */
+
+		if (col == 0 && opts->m1 > 0) return opts->m1;
+		if (col == 1 && opts->m2 > 0) return opts->m2;
+
+		/* 其它列先回退到默认 m（你未来扩展 N 列再改） */
+		return opts->m;
+	}
+
+	return HNSW_DEFAULT_M;
+}
+
 /*
  * Get the size of the dynamic candidate list in the index
  */
@@ -124,6 +144,23 @@ HnswGetEfConstruction(Relation index)
 
 	if (opts)
 		return opts->efConstruction;
+
+	return HNSW_DEFAULT_EF_CONSTRUCTION;
+}
+
+int
+HnswGetEfConstructionColumn(Relation index, int col)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+	{
+
+		if (col == 0 && opts->efConstruction1 > 0) return opts->efConstruction1;
+		if (col == 1 && opts->efConstruction2 > 0) return opts->efConstruction2;
+
+		return opts->efConstruction;
+	}
 
 	return HNSW_DEFAULT_EF_CONSTRUCTION;
 }
@@ -140,6 +177,18 @@ HnswOptionalProcInfo(Relation index, uint16 procnum)
 	return index_getprocinfo(index, 1, procnum);
 }
 
+FmgrInfo *
+HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum)
+{
+	AttrNumber attno = (AttrNumber) (col + 1); /* 1-based */
+
+	/* 先确认该 support proc 是否存在 */
+	if (!OidIsValid(index_getprocid(index, attno, procnum)))
+		return NULL;
+
+	return index_getprocinfo(index, attno, procnum);
+}
+
 /*
  * Init support functions
  */
@@ -149,6 +198,16 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+}
+
+void
+HnswInitSupportColumn(HnswSupport *support, Relation index, int col)
+{
+	AttrNumber attno = (AttrNumber) (col + 1); /* 1-based */
+
+	support->procinfo = index_getprocinfo(index, attno, HNSW_DISTANCE_PROC);
+	support->collation = index->rd_indcollation[col];
+	support->normprocinfo = HnswOptionalProcInfoColumn(index, col, HNSW_NORM_PROC);
 }
 
 /*
@@ -321,6 +380,86 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	UnlockReleaseBuffer(buf);
 }
 
+void
+HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoint)
+{
+	Buffer      buf;
+	Page        page;
+	HnswMetaPage metap; /* 先用旧结构读头 */
+
+	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	metap = HnswPageGetMeta(page); /* 先用旧结构读头 */
+
+	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
+		elog(ERROR, "hnsw index is not valid");
+
+	/* 旧布局 */
+	if (metap->version == HNSW_VERSION)
+	{
+		if (col != 0)
+			elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
+
+		if (m != NULL)
+			*m = metap->m;
+
+		if (entryPoint != NULL)
+		{
+			if (BlockNumberIsValid(metap->entryBlkno))
+			{
+				*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno);
+				(*entryPoint)->level = metap->entryLevel;
+			}
+			else
+				*entryPoint = NULL;
+		}
+
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+
+	/* 新布局 */
+	if (metap->version == HNSW_VERSION_MULTI)
+	{
+		HnswMetaPageMulti meta2 = HnswPageGetMetaMulti(page);
+
+		if (unlikely(meta2->magicNumber != HNSW_MAGIC_NUMBER))
+			elog(ERROR, "hnsw index is not valid (multi metapage)");
+		if (meta2->numGraphs != 2 && meta2->numGraphs != 1)
+			elog(ERROR, "hnsw multi metapage has invalid numGraphs=%hu", meta2->numGraphs);
+
+
+		if (col < 0 || col >= meta2->numGraphs)
+			elog(ERROR, "hnsw multi metapage col out of range: col=%d numGraphs=%u",
+				 col, meta2->numGraphs);
+
+		HnswMetaPageData *g = &meta2->graphs[col];
+
+		if (m != NULL)
+			*m = g->m;
+
+		if (entryPoint != NULL)
+		{
+			if (BlockNumberIsValid(g->entryBlkno))
+			{
+				*entryPoint = HnswInitElementFromBlock(g->entryBlkno, g->entryOffno);
+				(*entryPoint)->level = g->entryLevel;
+			}
+			else
+				*entryPoint = NULL;
+		}
+
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+
+	/* 未知版本 */
+	elog(ERROR, "hnsw metapage has unknown version: %u", metap->version);
+}
+
+
 /*
  * Get the entry point
  */
@@ -333,6 +472,116 @@ HnswGetEntryPoint(Relation index)
 
 	return entryPoint;
 }
+
+HnswElement
+HnswGetEntryPointColumn(Relation index, int col)
+{
+	HnswElement entryPoint;
+
+	/* 旧布局兼容：单列索引仍然走原版 */
+	if (col == 0 && IndexRelationGetNumberOfKeyAttributes(index) == 1)
+		return HnswGetEntryPoint(index);
+
+	/* 新布局：按列从 multi metapage 取 entrypoint */
+	HnswGetMetaPageInfoMulti(index, col, NULL, &entryPoint);
+
+	return entryPoint;
+}
+
+
+BlockNumber
+HnswGetHeadBlockColumn(Relation index, int col)
+{
+    Buffer buf;
+    Page page;
+    HnswMetaPage metap;
+    BlockNumber head;
+
+    buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+
+    metap = HnswPageGetMeta(page);
+
+    if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
+    {
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        elog(ERROR, "hnsw index is not valid");
+    }
+
+    /* 旧布局：只有一张图，起点就是固定的 HNSW_HEAD_BLKNO */
+    if (metap->version == HNSW_VERSION)
+    {
+        if (col != 0)
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
+        }
+
+        head = HNSW_HEAD_BLKNO;
+
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        return head;
+    }
+
+    /* 新布局：从 multi metapage 里取该列的 insertPage 作为遍历起点 */
+    if (metap->version == HNSW_VERSION_MULTI)
+    {
+        HnswMetaPageMulti meta2 = HnswPageGetMetaMulti(page);
+
+        if (unlikely(meta2->magicNumber != HNSW_MAGIC_NUMBER))
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw index is not valid (multi metapage)");
+        }
+
+        if (meta2->numGraphs != 2 && meta2->numGraphs != 1)
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw multi metapage has invalid numGraphs=%hu", meta2->numGraphs);
+        }
+
+        if (col < 0 || col >= meta2->numGraphs)
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw multi metapage col out of range: col=%d numGraphs=%u",
+                 col, meta2->numGraphs);
+        }
+
+        head = meta2->graphs[col].insertPage;
+
+        /* 你要求补的校验 */
+        if (!BlockNumberIsValid(head))
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            elog(ERROR, "hnsw multi metapage has invalid head/insertPage for col=%d", col);
+        }
+
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        return head;
+    }
+
+    /* 未知版本 */
+    {
+        uint32 ver = metap->version;
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        elog(ERROR, "hnsw metapage has unknown version: %u", ver);
+    }
+
+    return InvalidBlockNumber; /* unreachable */
+}
+
+
+
 
 /*
  * Update the metapage info
@@ -360,6 +609,71 @@ HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, Block
 
 	if (BlockNumberIsValid(insertPage))
 		metap->insertPage = insertPage;
+}
+
+static void
+HnswUpdateMetaPageInfoColumn(Page page, int col,
+							 int updateEntry,
+							 HnswElement entryPoint,
+							 BlockNumber insertPage)
+{
+	/* 先用旧头读 magic/version：multi 布局开头也放这些字段，所以安全 */
+    HnswMetaPage head = HnswPageGetMeta(page);
+
+    if (unlikely(head->magicNumber != HNSW_MAGIC_NUMBER))
+        elog(ERROR, "hnsw index is not valid");
+
+    /* 旧布局：单列索引，col 只能是 0，直接复用原版 helper */
+    if (head->version == HNSW_VERSION)
+    {
+        if (col != 0)
+            elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
+
+        HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
+        return;
+    }
+
+
+
+	    /* 新布局：多图 */
+    if (head->version == HNSW_VERSION_MULTI)
+    {
+        HnswMetaPageMulti meta = HnswPageGetMetaMulti(page);
+
+        if (meta->numGraphs != 2 && meta->numGraphs != 1)
+            elog(ERROR, "hnsw multi metapage has invalid numGraphs=%hu", meta->numGraphs);
+
+        if (col < 0 || col >= meta->numGraphs)
+            elog(ERROR, "hnsw multi metapage col out of range: col=%d numGraphs=%u",
+                 col, meta->numGraphs);
+
+        HnswMetaPageData *g = &meta->graphs[col];
+
+        /* === 完全复刻原版 HnswUpdateMetaPageInfo 语义 === */
+        if (updateEntry)
+        {
+            if (entryPoint == NULL)
+            {
+                g->entryBlkno = InvalidBlockNumber;
+                g->entryOffno = InvalidOffsetNumber;
+                g->entryLevel = -1;
+            }
+            else if (entryPoint->level > g->entryLevel ||
+                     updateEntry == HNSW_UPDATE_ENTRY_ALWAYS)
+            {
+                g->entryBlkno = entryPoint->blkno;
+                g->entryOffno = entryPoint->offno;
+                g->entryLevel = entryPoint->level;
+            }
+        }
+
+        if (BlockNumberIsValid(insertPage))
+            g->insertPage = insertPage;
+
+        return;
+    }
+
+    elog(ERROR, "hnsw metapage has unknown version: %u", head->version);
 }
 
 /*
@@ -393,6 +707,66 @@ HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, Bloc
 		GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
 }
+
+
+void
+HnswUpdateMetaPageMulti(Relation index, int col,
+                        int updateEntry,
+                        HnswElement entryPoint,
+                        BlockNumber insertPage,
+                        ForkNumber forkNum,
+                        bool building)
+{
+    Buffer          buf;
+    Page            page;
+    GenericXLogState *state;
+
+    buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+    if (building)
+    {
+        state = NULL;
+        page = BufferGetPage(buf);
+    }
+    else
+    {
+        state = GenericXLogStart(index);
+        page = GenericXLogRegisterBuffer(state, buf, 0);
+    }
+
+    /* 先用旧结构读头：magic/version 在新布局开头也存在，所以安全 */
+    HnswMetaPageData *head = HnswPageGetMeta(page);
+
+    if (unlikely(head->magicNumber != HNSW_MAGIC_NUMBER))
+        elog(ERROR, "hnsw index is not valid");
+
+    /* ---- 旧单列布局 ---- */
+    if (head->version == HNSW_VERSION)
+    {
+        if (col != 0)
+            elog(ERROR, "hnsw index metapage is single-column, but requested col=%d", col);
+
+        /* 复用原来的更新逻辑（你原工程里已有这个 helper） */
+        HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
+    }
+    /* ---- 新多列布局 ---- */
+    else if (head->version == HNSW_VERSION_MULTI)
+    {
+    	HnswUpdateMetaPageInfoColumn(page, col, updateEntry, entryPoint, insertPage);
+    }
+    else
+    {
+        elog(ERROR, "hnsw metapage has unknown version: %u", head->version);
+    }
+
+    if (building)
+        MarkBufferDirty(buf);
+    else
+        GenericXLogFinish(state);
+    UnlockReleaseBuffer(buf);
+}
+
 
 /*
  * Form index value
@@ -1377,6 +1751,25 @@ HnswGetTypeInfo(Relation index)
 		};
 
 		return (&typeInfo);
+	}
+	else
+		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));
+}
+
+const HnswTypeInfo *
+HnswGetTypeInfoColumn(Relation index, int col)
+{
+	FmgrInfo *procinfo = HnswOptionalProcInfoColumn(index, col, HNSW_TYPE_INFO_PROC);
+
+	if (procinfo == NULL)
+	{
+		static const HnswTypeInfo typeInfo = {
+			.maxDimensions = HNSW_MAX_DIM,
+			.normalize = l2_normalize,
+			.checkValue = NULL
+		};
+
+		return &typeInfo;
 	}
 	else
 		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));

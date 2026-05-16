@@ -1,6 +1,7 @@
 #ifndef HNSW_H
 #define HNSW_H
 
+
 #include "postgres.h"
 
 #include "access/genam.h"
@@ -21,6 +22,7 @@
 #define HNSW_TYPE_INFO_PROC 3
 
 #define HNSW_VERSION	1
+#define HNSW_VERSION_MULTI  2
 #define HNSW_MAGIC_NUMBER 0xA953A953
 #define HNSW_PAGE_ID	0xFF90
 
@@ -67,6 +69,7 @@
 
 #define HnswPageGetOpaque(page)	((HnswPageOpaque) PageGetSpecialPointer(page))
 #define HnswPageGetMeta(page)	((HnswMetaPageData *) PageGetContents(page))
+#define HnswPageGetMetaMulti(page) ((HnswMetaPageDataMulti *) PageGetContents(page))
 
 #if PG_VERSION_NUM >= 150000
 #define RandomDouble() pg_prng_double(&pg_global_prng_state)
@@ -183,6 +186,14 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+
+
+	// todo dkx
+	/* new: two-graph build options; 0 means “not provided” */
+	int   m1;
+	int   efConstruction1;
+	int   m2;
+	int   efConstruction2;
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -301,6 +312,19 @@ typedef struct HnswBuildState
 	char	   *hnswarea;
 }			HnswBuildState;
 
+typedef struct HnswBuildStateMulti
+{
+	/* 共享信息 */
+	Relation heap;
+	Relation index;
+	IndexInfo *indexInfo;
+	ForkNumber forkNum;
+
+	/* 多列 */
+	int nkeys;
+	HnswBuildState *cols;  /* [nkeys] */
+} HnswBuildStateMulti;
+
 typedef struct HnswMetaPageData
 {
 	uint32		magicNumber;
@@ -314,7 +338,20 @@ typedef struct HnswMetaPageData
 	BlockNumber insertPage;
 }			HnswMetaPageData;
 
+typedef struct HnswMetaPageDataMulti
+{
+	uint32      magicNumber;
+	uint32      version;
+
+	uint16      numGraphs;
+	uint16      reserved;
+
+	HnswMetaPageData graphs[2];
+} HnswMetaPageDataMulti;
+
+
 typedef HnswMetaPageData * HnswMetaPage;
+typedef HnswMetaPageDataMulti * HnswMetaPageMulti;
 
 typedef struct HnswPageOpaqueData
 {
@@ -382,6 +419,37 @@ typedef struct HnswScanOpaqueData
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
 
+
+typedef struct HnswScanOpaqueDataMulti
+{
+	/* 多列 */
+	int                 nkeys;      /* key 列数（不含 INCLUDE） */
+	int                 col;        /* 当前选中的列（0-based），后续在 rescan 阶段设置 */
+	HnswScanOpaqueData *cols;       /* [nkeys] */
+
+	/* 新增：多 ORDER BY 词典序支持 */
+	bool                orderby_inited;
+	int                 norderbys;
+	int                *orderby_cols;   /* [norderbys] 每个 ORDER BY key 对应的 index key col(0-based) */
+	int                 drive_col;      /* driving 列：orderby_cols[0] */
+
+	pairingheap         *tieheap;       /* 当前 d1 组的候选堆（按 d2.. 排） */
+	double               current_d1;    /* 当前 tieheap 所属的 d1 值 */
+
+} HnswScanOpaqueDataMulti;
+
+typedef HnswScanOpaqueDataMulti *HnswScanOpaqueMulti;
+
+typedef struct HnswTieCandidate
+{
+	pairingheap_node     ph_node;
+	ItemPointerData      tid;
+	float8              *dists;   /* dists[0]=d1, dists[1]=d2,... */
+} HnswTieCandidate;
+
+
+
+
 typedef struct HnswVacuumState
 {
 	/* Info */
@@ -409,9 +477,14 @@ typedef struct HnswVacuumState
 
 /* Methods */
 int			HnswGetM(Relation index);
+int			HnswGetMColumn(Relation index, int col);
 int			HnswGetEfConstruction(Relation index);
+int			HnswGetEfConstructionColumn(Relation index, int col);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
+FmgrInfo   *HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum);
+
 void		HnswInitSupport(HnswSupport * support, Relation index);
+void		HnswInitSupportColumn(HnswSupport *support, Relation index, int col);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
@@ -419,18 +492,26 @@ void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
+HnswElement HnswGetEntryPointColumn(Relation index, int col);
+
+BlockNumber HnswGetHeadBlockColumn(Relation index, int col);
+
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+void		HnswGetMetaPageInfoMulti(Relation index, int col, int *m, HnswElement *entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * q, Relation rel, HnswSupport * support, bool loadVec);
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
+void		HnswUpdateMetaPageMulti(Relation index, int col, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
 void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
 void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
 bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
+bool		HnswInsertTupleOnDiskMulti(Relation index, HnswSupport *support, Datum value, ItemPointer heaptid, bool building, int col);
+
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
@@ -440,23 +521,62 @@ void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElemen
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
+const		HnswTypeInfo *HnswGetTypeInfoColumn(Relation index, int col);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
+IndexBuildResult *hnswbuildmulti(Relation heap, Relation index, IndexInfo *indexInfo);
+IndexBuildResult *hnswbuild_dispatch(Relation heap, Relation index, IndexInfo *indexInfo);
+
+
 void		hnswbuildempty(Relation index);
+void		hnswbuildemptymulti(Relation index);
+void		hnswbuildempty_dispatch(Relation index);
+
 bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
 #if PG_VERSION_NUM >= 140000
 					   ,bool indexUnchanged
 #endif
 					   ,IndexInfo *indexInfo
 );
+bool		hnswinsertmulti(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+					   ,bool indexUnchanged
+#endif
+					   ,IndexInfo *indexInfo
+);
+bool		hnswinsert_dispatch(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+					   ,bool indexUnchanged
+#endif
+					   ,IndexInfo *indexInfo
+);
+
 IndexBulkDeleteResult *hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
+IndexBulkDeleteResult *hnswbulkdeletemulti(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
+IndexBulkDeleteResult *hnswbulkdelete_dispatch(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
+
 IndexBulkDeleteResult *hnswvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+IndexBulkDeleteResult *hnswvacuumcleanupmulti(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+IndexBulkDeleteResult *hnswvacuumcleanup_dispatch(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+
 IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
+IndexScanDesc hnswbeginscanmulti(Relation index, int nkeys, int norderbys);
+IndexScanDesc hnswbeginscan_dispatch(Relation index, int nkeys, int norderbys);
+
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+void		hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+void		hnswrescan_dispatch(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
+bool		hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir);
+bool		hnswgettuple_dispatch(IndexScanDesc scan, ScanDirection dir);
+
 void		hnswendscan(IndexScanDesc scan);
+void		hnswendscanmulti(IndexScanDesc scan);
+void		hnswendscan_dispatch(IndexScanDesc scan);
+
 
 static inline HnswNeighborArray *
 HnswGetNeighbors(char *base, HnswElement element, int lc)
