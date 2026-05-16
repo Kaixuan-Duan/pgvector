@@ -870,10 +870,17 @@ rrf_should_stop(HTAB *ht,
                 int depth1,
                 int depth2,
                 bool done1,
-                bool done2)
+                bool done2,
+                float8 *threshold_out,
+                float8 *upper_bound_out)
 {
     float8 threshold;
     float8 upper_bound;
+
+    if (threshold_out)
+        *threshold_out = -1.0;
+    if (upper_bound_out)
+        *upper_bound_out = -1.0;
 
     if (st->limit <= 0)
         return false;
@@ -882,6 +889,11 @@ rrf_should_stop(HTAB *ht,
         return false;
 
     upper_bound = rrf_future_upper_bound(ht, st, depth1, depth2, done1, done2);
+
+    if (threshold_out)
+        *threshold_out = threshold;
+    if (upper_bound_out)
+        *upper_bound_out = upper_bound;
 
     return threshold >= upper_bound;
 }
@@ -1002,6 +1014,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     bool parallel_mode = false;
     int depth1 = 0;
     int depth2 = 0;
+    int round = 0;
     bool done1 = false;
     bool done2 = false;
 
@@ -1094,11 +1107,27 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     if (!use_parallel)
         stream2 = HnswTopKStreamBegin(st->heapRel, st->indexRel, st->col2, st->op2, q2);
 
+    elog(WARNING,
+         "VectorRRF batch mode: parallel=%d batch_size=%d cand1=%d cand2=%d limit=%d k=%d w1=%.6f w2=%.6f",
+         (int) use_parallel,
+         RRF_BATCH_SIZE,
+         st->cand1,
+         st->cand2,
+         st->limit,
+         st->k_int,
+         st->w1,
+         st->w2);
+
     while (!done1 || !done2)
     {
         uint32 request_no = 0;
         int n1 = 0;
         int n2 = 0;
+        float8 threshold = -1.0;
+        float8 upper_bound = -1.0;
+        bool stop_now;
+
+        round++;
 
         if (!done2 && use_parallel)
             request_no = rrf_request_parallel_batch(shared_state);
@@ -1152,8 +1181,35 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         if (depth2 >= st->cand2)
             done2 = true;
 
-        if (rrf_should_stop(ht, st, depth1, depth2, done1, done2))
+        stop_now = rrf_should_stop(ht, st, depth1, depth2, done1, done2,
+                                   &threshold, &upper_bound);
+
+        elog(WARNING,
+             "VectorRRF batch round=%d request=%u n1=%d n2=%d depth1=%d depth2=%d done1=%d done2=%d seen=%ld threshold=%.9f upper_bound=%.9f stop=%d",
+             round,
+             request_no,
+             n1,
+             n2,
+             depth1,
+             depth2,
+             (int) done1,
+             (int) done2,
+             (long) hash_get_num_entries(ht),
+             threshold,
+             upper_bound,
+             (int) stop_now);
+
+        if (stop_now)
+        {
+            elog(WARNING,
+                 "VectorRRF prune hit: round=%d depth1=%d depth2=%d threshold=%.9f upper_bound=%.9f",
+                 round,
+                 depth1,
+                 depth2,
+                 threshold,
+                 upper_bound);
             break;
+        }
 
         if (n1 == 0 && n2 == 0 && (done1 || !use_parallel || done2))
         {
@@ -1179,7 +1235,13 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
 
     st->nresults = rrf_collect_results(ht, st->limit, &st->results);
     st->cursor = 0;
-    //elog(WARNING, "VectorRRF: st->nresults=%d", n);
+    elog(WARNING,
+         "VectorRRF batch summary: rounds=%d depth1=%d depth2=%d final_results=%d parallel=%d",
+         round,
+         depth1,
+         depth2,
+         st->nresults,
+         (int) use_parallel);
 
     if (!use_parallel && pcxt != NULL)
         DestroyParallelContext(pcxt);
