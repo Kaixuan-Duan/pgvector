@@ -44,6 +44,7 @@
 // 添加并行相关代码
 #include "access/parallel.h"
 #include "storage/shm_toc.h"
+#include "utils/wait_event.h"
 #include "rrf_parallel.h"
 
 
@@ -177,7 +178,7 @@ load_rrf_func_oids(void)
 
     fname = list_make1(makeString("rrf"));
 
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 170000 || defined(GP_VERSION_NUM)
     /*
      * PG17: FuncnameGetCandidates() 多了一个参数（通常是 missing_ok）
      * 这里传 true：找不到也别报错，返回空即可
@@ -644,7 +645,11 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand1_expr));
     cpath->custom_private = lappend(cpath->custom_private, (Node *) copyObject(cand2_expr));
 
+#ifdef GP_VERSION_NUM
+    add_path(rel, &cpath->path, root);
+#else
     add_path(rel, &cpath->path);
+#endif
 }
 
 /* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
@@ -690,6 +695,11 @@ vector_rrf_create_scan_state(CustomScan *cscan)
     return (Node *) st;
 }
 
+/*
+    * 1. eval params
+    * 2. run RRF algorithm, store results in st->results
+    * 3. prepare for heap fetch via index
+*/
 static void
 vector_rrf_eval_params(VectorRRFScanState *st)
 {
@@ -740,182 +750,68 @@ vector_rrf_eval_params(VectorRRFScanState *st)
 }
 
 static void
-vector_rrf_prepare_results(VectorRRFScanState *st)
+rrf_hash_add_batch(HTAB *ht,
+                   HnswTopKItem *items,
+                   int nitems,
+                   int route,
+                   int *depth,
+                   VectorRRFScanState *st)
 {
-   MemoryContext old = MemoryContextSwitchTo(st->rrf_mcxt);
-
-    /* evaluate params (op/k/w/cand/limit) */
-    vector_rrf_eval_params(st);
-
-    /* Eval q1/q2 */
-    ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
-    bool isnull1 = false, isnull2 = false;
-    Datum q1 = ExecEvalExprSwitchContext(st->q1_state, econtext, &isnull1);
-    Datum q2 = ExecEvalExprSwitchContext(st->q2_state, econtext, &isnull2);
-    if (isnull1 || isnull2)
-        ereport(ERROR, (errmsg("rrf query vector must not be NULL")));
-
-    if (st->cand1 <= 0 || st->cand2 <= 0)
-        ereport(ERROR, (errmsg("cand1/cand2 must be > 0")));
-
-    /* topK arrays */
-    HnswTopKItem *list1 = palloc0(sizeof(HnswTopKItem) * st->cand1);
-    // list2会先使用DSM共享内存,如果并行失败则使用本地内存
-    HnswTopKItem *list2 = NULL;
-    int n1 = 0, n2 = 0;
-
-    /* --- 并行执行准备 --- */
-    ParallelContext *pcxt = NULL;
-    RrfSharedState  *shared_state = NULL;
-    Size             q2_size = VARSIZE_ANY(DatumGetPointer(q2)); /* 获取向量的实际字节大小 */
-    Size             list2_size = sizeof(HnswTopKItem) * st->cand2;
-
-
-    EnterParallelMode();
-
-    /* * 参数 1："vector" 是你的插件/库的名称 (根据你的 Makefile/extension 确定)。
-     * 参数 2：我们在 rrf_parallel.c 里定义的 Worker 入口函数。
-     * 参数 3：请求 1 个 Worker 进程。
-     */
-    pcxt = CreateParallelContext("hybrid_vector","RrfParallelWorkerMain",1);
-
-
-    /* 估算共享内存大小 */
-    shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RrfSharedState));
-    shm_toc_estimate_chunk(&pcxt->estimator, q2_size);
-    shm_toc_estimate_chunk(&pcxt->estimator, list2_size);
-    shm_toc_estimate_keys(&pcxt->estimator, 3);
-
-    //初始化DSM
-    InitializeParallelDSM(pcxt);
-    //elog(WARNING, "完成DSM初始化");
-    if (pcxt->seg != NULL)
+    for (int i = 0; i < nitems; i++)
     {
-        /* 分配共享内存块 */
-        shared_state = shm_toc_allocate(pcxt->toc, sizeof(RrfSharedState));
-        Pointer q2_shared = shm_toc_allocate(pcxt->toc, q2_size);
-        list2 = shm_toc_allocate(pcxt->toc, list2_size);
-
-        /* 填充元数据 */
-        shared_state->heap_oid  = RelationGetRelid(st->heapRel);
-        shared_state->index_oid = RelationGetRelid(st->indexRel);
-        shared_state->col2      = st->col2;
-        shared_state->op2       = st->op2;
-        shared_state->cand2     = st->cand2;
-        shared_state->n2_result = 0;
-
-        /* 将 q2 向量的字节拷贝进共享内存 */
-        memcpy(q2_shared, DatumGetPointer(q2), q2_size);
-
-        /* 注册 Key */
-        shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_SHARED, shared_state);
-        shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_Q2, q2_shared);
-        shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_LIST2, list2);
-
-        /* 正式启动 Worker！ */
-        LaunchParallelWorkers(pcxt);
-    }
-    /* --- 主进程执行 Col 1 --- */
-    HnswTopKForColumn(st->heapRel, st->indexRel, st->col1, st->op1, q1, st->cand1, list1, &n1);
-
-    /* --- 处理 Col 2 的结果 --- */
-    if (pcxt->seg != NULL && pcxt->nworkers_launched > 0)
-    {
-        /* * 成功拉起了 Worker：主进程挂起，等待 Worker 算完 col2
-         */
-        //elog(WARNING,"开始等待");
-        WaitForParallelWorkersToFinish(pcxt);
-        n2 = shared_state->n2_result;
-
-        /* 🚨 救命操作：在销毁 DSM 之前，把 Worker 算好的 list2 拷贝回本地内存！ 🚨 */
-        HnswTopKItem *local_list2 = palloc0(list2_size);
-        memcpy(local_list2, list2, list2_size);
-        /* 让后续逻辑使用我们本地的安全数组 */
-        list2 = local_list2;
-
-        //elog(WARNING, "VectorRRF Parallel: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
-        //     st->op1, st->op2, st->cand1, st->cand2, n1, n2);
-    }else{
-        /* * 降级处理 (Fallback)：如果没有可用系统资源拉起 Worker，
-         * 我们退回到原来的串行模式，由主进程自己亲自算 col2。
-         */
-        //elog(WARNING, "VectorRRF: Failed to launch parallel worker, falling back to serial execution");
-
-        /* 如果 DSM 分配失败，给 list2 分配本地内存 */
-        if (list2 == NULL) {
-            list2 = palloc0(list2_size);
-        }
-
-        HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2, st->cand2, list2, &n2);
-    }
-    /* 销毁并行上下文并退出并行模式 */
-    DestroyParallelContext(pcxt);
-    ExitParallelMode();
-
-    //elog(WARNING, "VectorRRF: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
-     // st->op1, st->op2, st->cand1, st->cand2, n1, n2);
-
-
-
-    /* merge by tid */
-    HASHCTL ctl;
-    memset(&ctl, 0, sizeof(ctl));
-    ctl.keysize = sizeof(uint64);
-    ctl.entrysize = sizeof(RRFHashEntry);
-    // HTAB *ht = hash_create("rrf_hash", n1 + n2, &ctl, HASH_ELEM);
-    HTAB *ht = hash_create("rrf_hash", Max(n1 + n2, 16), &ctl, HASH_ELEM | HASH_BLOBS);
-
-
-    /* 路1 */
-    for (int i = 0; i < n1; i++)
-    {
-        uint64 key = tid_to_key(&list1[i].tid);
+        int rank = ++(*depth);
+        uint64 key = tid_to_key(&items[i].tid);
         bool found;
         RRFHashEntry *e = hash_search(ht, &key, HASH_ENTER, &found);
+
         if (!found)
         {
             e->key = key;
-            e->tid = list1[i].tid;
+            e->tid = items[i].tid;
             e->r1 = e->r2 = 0;
             e->d1 = e->d2 = 0;
             e->score = 0;
         }
-        e->r1 = i + 1;
-        e->d1 = list1[i].distance;
-        e->score += st->w1 / (st->k + (float8)(i + 1));
-    }
 
-    /* 路2 */
-    for (int i = 0; i < n2; i++)
-    {
-        uint64 key = tid_to_key(&list2[i].tid);
-        bool found;
-        RRFHashEntry *e = hash_search(ht, &key, HASH_ENTER, &found);
-        if (!found)
+        if (route == 1)
         {
-            e->key = key;
-            e->tid = list2[i].tid;
-            e->r1 = e->r2 = 0;
-            e->d1 = e->d2 = 0;
-            e->score = 0;
+            if (e->r1 == 0)
+            {
+                e->r1 = rank;
+                e->d1 = items[i].distance;
+                e->score += st->w1 / (st->k + (float8) rank);
+            }
         }
-        e->r2 = i + 1;
-        e->d2 = list2[i].distance;
-        e->score += st->w2 / (st->k + (float8)(i + 1));
+        else
+        {
+            if (e->r2 == 0)
+            {
+                e->r2 = rank;
+                e->d2 = items[i].distance;
+                e->score += st->w2 / (st->k + (float8) rank);
+            }
+        }
     }
+}
 
-    /* 5) hash → array */
+static bool
+rrf_current_threshold(HTAB *ht, int limit, float8 *threshold_out)
+{
     int cap = hash_get_num_entries(ht);
-    RRFResultItem *arr = palloc0(sizeof(RRFResultItem) * cap);
-
+    RRFResultItem *arr;
     HASH_SEQ_STATUS seq;
-    hash_seq_init(&seq, ht);
-
     int n = 0;
+
+    if (limit <= 0 || cap < limit)
+        return false;
+
+    arr = palloc0(sizeof(RRFResultItem) * cap);
+    hash_seq_init(&seq, ht);
     for (;;)
     {
         RRFHashEntry *e = (RRFHashEntry *) hash_seq_search(&seq);
-        if (!e) break;
+        if (!e)
+            break;
 
         arr[n].tid = e->tid;
         arr[n].score = e->score;
@@ -926,16 +822,369 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         n++;
     }
 
-    /* 6) sort + 截断 top LIMIT */
+    qsort(arr, n, sizeof(RRFResultItem), cmp_rrf_item_desc);
+    *threshold_out = arr[limit - 1].score;
+    pfree(arr);
+
+    return true;
+}
+
+static float8
+rrf_future_upper_bound(HTAB *ht,
+                       VectorRRFScanState *st,
+                       int depth1,
+                       int depth2,
+                       bool done1,
+                       bool done2)
+{
+    float8 future1 = done1 ? 0 : st->w1 / (st->k + (float8) (depth1 + 1));
+    float8 future2 = done2 ? 0 : st->w2 / (st->k + (float8) (depth2 + 1));
+    float8 max_bound = future1 + future2;
+    HASH_SEQ_STATUS seq;
+
+    hash_seq_init(&seq, ht);
+    for (;;)
+    {
+        RRFHashEntry *e = (RRFHashEntry *) hash_seq_search(&seq);
+        float8 bound;
+
+        if (!e)
+            break;
+
+        bound = e->score;
+        if (e->r1 == 0)
+            bound += future1;
+        if (e->r2 == 0)
+            bound += future2;
+
+        if (bound > max_bound)
+            max_bound = bound;
+    }
+
+    return max_bound;
+}
+
+static bool
+rrf_should_stop(HTAB *ht,
+                VectorRRFScanState *st,
+                int depth1,
+                int depth2,
+                bool done1,
+                bool done2)
+{
+    float8 threshold;
+    float8 upper_bound;
+
+    if (st->limit <= 0)
+        return false;
+
+    if (!rrf_current_threshold(ht, st->limit, &threshold))
+        return false;
+
+    upper_bound = rrf_future_upper_bound(ht, st, depth1, depth2, done1, done2);
+
+    return threshold >= upper_bound;
+}
+
+static uint32
+rrf_request_parallel_batch(RrfSharedState *shared_state)
+{
+    uint32 request_no;
+
+    SpinLockAcquire(&shared_state->mutex);
+    request_no = shared_state->request_no + 1;
+    shared_state->request_no = request_no;
+    shared_state->nitems = 0;
+    SpinLockRelease(&shared_state->mutex);
+
+    ConditionVariableBroadcast(&shared_state->cv);
+
+    return request_no;
+}
+
+static int
+rrf_wait_parallel_batch(RrfSharedState *shared_state,
+                        HnswTopKItem *shared_batch,
+                        HnswTopKItem *local_batch,
+                        uint32 request_no,
+                        bool *done_out)
+{
+    int nitems;
+
+    for (;;)
+    {
+        SpinLockAcquire(&shared_state->mutex);
+        if (shared_state->ready_no >= request_no || shared_state->done || shared_state->stop)
+        {
+            nitems = shared_state->nitems;
+            *done_out = shared_state->done || shared_state->stop;
+            SpinLockRelease(&shared_state->mutex);
+            break;
+        }
+        SpinLockRelease(&shared_state->mutex);
+
+        ConditionVariableSleep(&shared_state->cv,
+                               WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+    }
+    ConditionVariableCancelSleep();
+
+    if (nitems > 0)
+        memcpy(local_batch, shared_batch, sizeof(HnswTopKItem) * nitems);
+
+    return nitems;
+}
+
+static void
+rrf_stop_parallel_worker(RrfSharedState *shared_state)
+{
+    if (shared_state == NULL)
+        return;
+
+    SpinLockAcquire(&shared_state->mutex);
+    shared_state->stop = true;
+    SpinLockRelease(&shared_state->mutex);
+
+    ConditionVariableBroadcast(&shared_state->cv);
+}
+
+static int
+rrf_collect_results(HTAB *ht, int limit, RRFResultItem **results_out)
+{
+    int cap = hash_get_num_entries(ht);
+    RRFResultItem *arr = palloc0(sizeof(RRFResultItem) * Max(cap, 1));
+    HASH_SEQ_STATUS seq;
+    int n = 0;
+
+    hash_seq_init(&seq, ht);
+    for (;;)
+    {
+        RRFHashEntry *e = (RRFHashEntry *) hash_seq_search(&seq);
+        if (!e)
+            break;
+
+        arr[n].tid = e->tid;
+        arr[n].score = e->score;
+        arr[n].r1 = e->r1;
+        arr[n].r2 = e->r2;
+        arr[n].d1 = e->d1;
+        arr[n].d2 = e->d2;
+        n++;
+    }
+
     qsort(arr, n, sizeof(RRFResultItem), cmp_rrf_item_desc);
 
-    if (st->limit > 0 && n > st->limit)
-        n = st->limit;
+    if (limit > 0 && n > limit)
+        n = limit;
 
-    st->results = arr;
-    st->nresults = n;
+    *results_out = arr;
+    return n;
+}
+
+static void
+vector_rrf_prepare_results(VectorRRFScanState *st)
+{
+    MemoryContext old = MemoryContextSwitchTo(st->rrf_mcxt);
+    ExprContext *econtext;
+    bool isnull1 = false;
+    bool isnull2 = false;
+    Datum q1;
+    Datum q2;
+    HnswTopKItem *batch1;
+    HnswTopKItem *batch2;
+    HTAB *ht;
+    HASHCTL ctl;
+    HnswTopKStream *stream1 = NULL;
+    HnswTopKStream *stream2 = NULL;
+    ParallelContext *pcxt = NULL;
+    RrfSharedState *shared_state = NULL;
+    HnswTopKItem *shared_batch2 = NULL;
+    bool use_parallel = false;
+    bool parallel_mode = false;
+    int depth1 = 0;
+    int depth2 = 0;
+    bool done1 = false;
+    bool done2 = false;
+
+    /* evaluate params (op/k/w/cand/limit) */
+    vector_rrf_eval_params(st);
+
+    /* Eval q1/q2 */
+    econtext = st->css.ss.ps.ps_ExprContext;
+    q1 = ExecEvalExprSwitchContext(st->q1_state, econtext, &isnull1);
+    q2 = ExecEvalExprSwitchContext(st->q2_state, econtext, &isnull2);
+    if (isnull1 || isnull2)
+        ereport(ERROR, (errmsg("rrf query vector must not be NULL")));
+
+    if (st->cand1 <= 0 || st->cand2 <= 0)
+        ereport(ERROR, (errmsg("cand1/cand2 must be > 0")));
+
+    if (st->w1 <= 0 || st->w2 <= 0)
+        ereport(ERROR, (errmsg("w1/w2 must be > 0 for adaptive RRF early stop")));
+
+    batch1 = palloc0(sizeof(HnswTopKItem) * RRF_BATCH_SIZE);
+    batch2 = palloc0(sizeof(HnswTopKItem) * RRF_BATCH_SIZE);
+
+    memset(&ctl, 0, sizeof(ctl));
+    ctl.keysize = sizeof(uint64);
+    ctl.entrysize = sizeof(RRFHashEntry);
+    ht = hash_create("rrf_hash", Max(st->cand1 + st->cand2, 16), &ctl,
+                     HASH_ELEM | HASH_BLOBS);
+
+    /*
+     * Try to run col2 in a worker. If no worker launches, keep the same
+     * batched RRF loop with both streams in the leader.
+     */
+    EnterParallelMode();
+    parallel_mode = true;
+    pcxt = CreateParallelContext("hybrid_vector", "RrfParallelWorkerMain", 1);
+
+    {
+        Size q2_size = VARSIZE_ANY(DatumGetPointer(q2));
+        Size batch2_size = sizeof(HnswTopKItem) * RRF_BATCH_SIZE;
+
+        shm_toc_estimate_chunk(&pcxt->estimator, sizeof(RrfSharedState));
+        shm_toc_estimate_chunk(&pcxt->estimator, q2_size);
+        shm_toc_estimate_chunk(&pcxt->estimator, batch2_size);
+        shm_toc_estimate_keys(&pcxt->estimator, 3);
+
+        InitializeParallelDSM(pcxt);
+        if (pcxt->seg != NULL)
+        {
+            Pointer q2_shared;
+
+            shared_state = shm_toc_allocate(pcxt->toc, sizeof(RrfSharedState));
+            q2_shared = shm_toc_allocate(pcxt->toc, q2_size);
+            shared_batch2 = shm_toc_allocate(pcxt->toc, batch2_size);
+
+            memset(shared_state, 0, sizeof(RrfSharedState));
+            shared_state->heap_oid = RelationGetRelid(st->heapRel);
+            shared_state->index_oid = RelationGetRelid(st->indexRel);
+            shared_state->col2 = st->col2;
+            shared_state->op2 = st->op2;
+            shared_state->cand2 = st->cand2;
+            shared_state->batch_size = RRF_BATCH_SIZE;
+            SpinLockInit(&shared_state->mutex);
+            ConditionVariableInit(&shared_state->cv);
+
+            memcpy(q2_shared, DatumGetPointer(q2), q2_size);
+
+            shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_SHARED, shared_state);
+            shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_Q2, q2_shared);
+            shm_toc_insert(pcxt->toc, PARALLEL_KEY_RRF_BATCH2, shared_batch2);
+
+            LaunchParallelWorkers(pcxt);
+            use_parallel = pcxt->nworkers_launched > 0;
+        }
+    }
+
+    if (!use_parallel)
+    {
+        if (pcxt != NULL)
+            DestroyParallelContext(pcxt);
+        pcxt = NULL;
+
+        if (parallel_mode)
+        {
+            ExitParallelMode();
+            parallel_mode = false;
+        }
+    }
+
+    stream1 = HnswTopKStreamBegin(st->heapRel, st->indexRel, st->col1, st->op1, q1);
+    if (!use_parallel)
+        stream2 = HnswTopKStreamBegin(st->heapRel, st->indexRel, st->col2, st->op2, q2);
+
+    while (!done1 || !done2)
+    {
+        uint32 request_no = 0;
+        int n1 = 0;
+        int n2 = 0;
+
+        if (!done2 && use_parallel)
+            request_no = rrf_request_parallel_batch(shared_state);
+
+        if (!done1)
+        {
+            int remaining1 = st->cand1 - depth1;
+            bool stream_done1 = false;
+
+            if (remaining1 <= 0)
+                done1 = true;
+            else
+            {
+                int max_batch1 = Min(RRF_BATCH_SIZE, remaining1);
+                HnswTopKStreamNextBatch(stream1, max_batch1, batch1, &n1, &stream_done1);
+                done1 = stream_done1 || depth1 + n1 >= st->cand1;
+            }
+        }
+
+        if (!done2)
+        {
+            if (use_parallel)
+            {
+                n2 = rrf_wait_parallel_batch(shared_state,
+                                             shared_batch2,
+                                             batch2,
+                                             request_no,
+                                             &done2);
+            }
+            else
+            {
+                int remaining2 = st->cand2 - depth2;
+                bool stream_done2 = false;
+
+                if (remaining2 <= 0)
+                    done2 = true;
+                else
+                {
+                    int max_batch2 = Min(RRF_BATCH_SIZE, remaining2);
+                    HnswTopKStreamNextBatch(stream2, max_batch2, batch2, &n2, &stream_done2);
+                    done2 = stream_done2 || depth2 + n2 >= st->cand2;
+                }
+            }
+        }
+
+        rrf_hash_add_batch(ht, batch1, n1, 1, &depth1, st);
+        rrf_hash_add_batch(ht, batch2, n2, 2, &depth2, st);
+
+        if (depth1 >= st->cand1)
+            done1 = true;
+        if (depth2 >= st->cand2)
+            done2 = true;
+
+        if (rrf_should_stop(ht, st, depth1, depth2, done1, done2))
+            break;
+
+        if (n1 == 0 && n2 == 0 && (done1 || !use_parallel || done2))
+        {
+            if (done1 && done2)
+                break;
+        }
+    }
+
+    HnswTopKStreamEnd(stream1);
+    stream1 = NULL;
+    HnswTopKStreamEnd(stream2);
+    stream2 = NULL;
+
+    if (use_parallel)
+    {
+        rrf_stop_parallel_worker(shared_state);
+        WaitForParallelWorkersToFinish(pcxt);
+        DestroyParallelContext(pcxt);
+        pcxt = NULL;
+        ExitParallelMode();
+        parallel_mode = false;
+    }
+
+    st->nresults = rrf_collect_results(ht, st->limit, &st->results);
     st->cursor = 0;
     //elog(WARNING, "VectorRRF: st->nresults=%d", n);
+
+    if (!use_parallel && pcxt != NULL)
+        DestroyParallelContext(pcxt);
+    if (parallel_mode)
+        ExitParallelMode();
 
     MemoryContextSwitchTo(old);
 }
@@ -1019,7 +1268,6 @@ vector_rrf_exec(CustomScanState *node)
 
     while (st->cursor < st->nresults)
     {
-        int cur = st->cursor;              /* 当前要处理的下标 */
         RRFResultItem *it = &st->results[st->cursor++];
 
         /* --- DEBUG: cursor / tid / score --- */
@@ -1054,7 +1302,7 @@ vector_rrf_exec(CustomScanState *node)
             call_again = false;
             ExecClearTuple(st->heapSlot);
 
-#if PG_VERSION_NUM >= 160000
+#if PG_VERSION_NUM >= 160000 || defined(GP_VERSION_NUM)
             ok = table_index_fetch_tuple(st->fetch,
                                          &it->tid,
                                          st->snapshot,

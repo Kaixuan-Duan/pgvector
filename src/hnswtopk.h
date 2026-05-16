@@ -6,6 +6,7 @@
 #pragma once
 
 #include "postgres.h"
+
 #include "access/htup_details.h"
 #include "utils/rel.h"
 
@@ -14,6 +15,20 @@ typedef struct HnswTopKItem
     ItemPointerData tid;
     float8 distance;   /* 现在不再读取真实值，仅占位 */
 } HnswTopKItem;
+
+typedef struct HnswTopKStream HnswTopKStream;
+
+HnswTopKStream *HnswTopKStreamBegin(Relation heapRel,
+                                    Relation indexRel,
+                                    int col,
+                                    Oid orderby_op,
+                                    Datum query);
+int HnswTopKStreamNextBatch(HnswTopKStream *stream,
+                            int max_batch,
+                            HnswTopKItem *out,
+                            int *out_nfound,
+                            bool *out_done);
+void HnswTopKStreamEnd(HnswTopKStream *stream);
 
 /*
  * col: 0-based，第几列/第几张图
