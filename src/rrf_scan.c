@@ -795,17 +795,38 @@ rrf_hash_add_batch(HTAB *ht,
 }
 
 static bool
-rrf_current_threshold(HTAB *ht, int limit, float8 *threshold_out)
+rrf_tid_in_keys(const uint64 *keys, int nkeys, uint64 key)
+{
+    for (int i = 0; i < nkeys; i++)
+    {
+        if (keys[i] == key)
+            return true;
+    }
+    return false;
+}
+
+typedef struct RRFTopKSnapshot
+{
+    RRFResultItem *items;
+    int nitems;
+    uint64 *topk_keys;
+    int ntopk;
+    float8 threshold;
+} RRFTopKSnapshot;
+
+static bool
+rrf_build_topk_snapshot(HTAB *ht, int limit, RRFTopKSnapshot *snap)
 {
     int cap = hash_get_num_entries(ht);
-    RRFResultItem *arr;
     HASH_SEQ_STATUS seq;
     int n = 0;
+
+    memset(snap, 0, sizeof(*snap));
 
     if (limit <= 0 || cap < limit)
         return false;
 
-    arr = palloc0(sizeof(RRFResultItem) * cap);
+    snap->items = palloc0(sizeof(RRFResultItem) * cap);
     hash_seq_init(&seq, ht);
     for (;;)
     {
@@ -813,18 +834,23 @@ rrf_current_threshold(HTAB *ht, int limit, float8 *threshold_out)
         if (!e)
             break;
 
-        arr[n].tid = e->tid;
-        arr[n].score = e->score;
-        arr[n].r1 = e->r1;
-        arr[n].r2 = e->r2;
-        arr[n].d1 = e->d1;
-        arr[n].d2 = e->d2;
+        snap->items[n].tid = e->tid;
+        snap->items[n].score = e->score;
+        snap->items[n].r1 = e->r1;
+        snap->items[n].r2 = e->r2;
+        snap->items[n].d1 = e->d1;
+        snap->items[n].d2 = e->d2;
         n++;
     }
 
-    qsort(arr, n, sizeof(RRFResultItem), cmp_rrf_item_desc);
-    *threshold_out = arr[limit - 1].score;
-    pfree(arr);
+    qsort(snap->items, n, sizeof(RRFResultItem), cmp_rrf_item_desc);
+
+    snap->nitems = n;
+    snap->ntopk = limit;
+    snap->threshold = snap->items[limit - 1].score;
+    snap->topk_keys = palloc(sizeof(uint64) * limit);
+    for (int i = 0; i < limit; i++)
+        snap->topk_keys[i] = tid_to_key(&snap->items[i].tid);
 
     return true;
 }
@@ -835,7 +861,8 @@ rrf_future_upper_bound(HTAB *ht,
                        int depth1,
                        int depth2,
                        bool done1,
-                       bool done2)
+                       bool done2,
+                       const RRFTopKSnapshot *snap)
 {
     float8 future1 = done1 ? 0 : st->w1 / (st->k + (float8) (depth1 + 1));
     float8 future2 = done2 ? 0 : st->w2 / (st->k + (float8) (depth2 + 1));
@@ -850,6 +877,9 @@ rrf_future_upper_bound(HTAB *ht,
 
         if (!e)
             break;
+
+        if (rrf_tid_in_keys(snap->topk_keys, snap->ntopk, e->key))
+            continue;
 
         bound = e->score;
         if (e->r1 == 0)
@@ -874,7 +904,7 @@ rrf_should_stop(HTAB *ht,
                 float8 *threshold_out,
                 float8 *upper_bound_out)
 {
-    float8 threshold;
+    RRFTopKSnapshot snap;
     float8 upper_bound;
 
     if (threshold_out)
@@ -885,17 +915,17 @@ rrf_should_stop(HTAB *ht,
     if (st->limit <= 0)
         return false;
 
-    if (!rrf_current_threshold(ht, st->limit, &threshold))
+    if (!rrf_build_topk_snapshot(ht, st->limit, &snap))
         return false;
 
-    upper_bound = rrf_future_upper_bound(ht, st, depth1, depth2, done1, done2);
+    upper_bound = rrf_future_upper_bound(ht, st, depth1, depth2, done1, done2, &snap);
 
     if (threshold_out)
-        *threshold_out = threshold;
+        *threshold_out = snap.threshold;
     if (upper_bound_out)
         *upper_bound_out = upper_bound;
 
-    return threshold >= upper_bound;
+    return snap.threshold > upper_bound;
 }
 
 static uint32
