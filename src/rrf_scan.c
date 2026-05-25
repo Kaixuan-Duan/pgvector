@@ -896,8 +896,8 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         if (arr[i].r2 > 0) {
             float8 ip_dense = is_neg_ip2 ? -arr[i].d2 : arr[i].d2;
             score_dense = ip_dense;
-            /* 归一化点积截断 */
-            if (score_dense < -1.0) score_dense = -1.0;
+            /* 只加分不扣分：max(dot, 0)，并保留归一化上限截断 */
+            if (score_dense < 0.0)  score_dense = 0.0;
             if (score_dense > 1.0)  score_dense = 1.0;
         }
 
