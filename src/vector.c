@@ -37,7 +37,7 @@
 
 PG_MODULE_MAGIC;
 
-void VectorRrfInit(void);
+void VectorLinearInit(void);
 /*
  * Initialize index options and variables
  */
@@ -49,7 +49,7 @@ _PG_init(void)
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
-	VectorRrfInit();
+	VectorLinearInit();
 }
 
 /*

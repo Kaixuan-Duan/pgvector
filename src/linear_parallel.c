@@ -10,7 +10,7 @@
 #include "access/table.h"
 #include "utils/rel.h"
 #include "hnswtopk.h"
-#include "rrf_parallel.h"
+#include "linear_parallel.h"
 #include "access/genam.h"
 
 
@@ -18,9 +18,9 @@
  * Worker 进程的真正入口
  */
 void
-RrfParallelWorkerMain(dsm_segment *seg, shm_toc *toc)
+LinearParallelWorkerMain(dsm_segment *seg, shm_toc *toc)
 {
-    RrfSharedState *shared_state;
+    LinearSharedState *shared_state;
     Pointer         q2_ptr;
     HnswTopKItem   *list2_shared;
     Datum           q2_datum;
@@ -28,9 +28,9 @@ RrfParallelWorkerMain(dsm_segment *seg, shm_toc *toc)
     Relation        indexRel;
 
     /* 1. 从共享内存中取出参数 */
-    shared_state = shm_toc_lookup(toc, PARALLEL_KEY_RRF_SHARED, false);
-    q2_ptr       = shm_toc_lookup(toc, PARALLEL_KEY_RRF_Q2, false);
-    list2_shared = shm_toc_lookup(toc, PARALLEL_KEY_RRF_LIST2, false);
+    shared_state = shm_toc_lookup(toc, PARALLEL_KEY_LINEAR_SHARED, false);
+    q2_ptr       = shm_toc_lookup(toc, PARALLEL_KEY_LINEAR_Q2, false);
+    list2_shared = shm_toc_lookup(toc, PARALLEL_KEY_LINEAR_LIST2, false);
     elog(WARNING, "worker取参数成功");
 
     /* 构造 Datum：直接指向 DSM 中的变长数组 (varlena) */

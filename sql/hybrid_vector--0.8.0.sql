@@ -1,5 +1,5 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION hybrid_vector" to load this file. \quit
+\echo Use "CREATE EXTENSION vector" to load this file. \quit
 
 -- vector type
 
@@ -919,12 +919,12 @@ CREATE OPERATOR CLASS sparsevec_l1_ops
 
 
 -- ------------------------------------------------------------
--- Linear fusion score function (planner hook / custom scan marker)
--- NOTE: Implementation is in C symbol: linear
+-- RRF fusion score function (planner hook / custom scan marker)
+-- NOTE: Implementation is in C symbol: rrf
 -- ------------------------------------------------------------
 
 -- 1) sparsevec + vector
-CREATE FUNCTION linear(
+CREATE FUNCTION rrf(
     emb1   sparsevec,
     op1    regoperator,
     q1     sparsevec,
@@ -938,11 +938,11 @@ CREATE FUNCTION linear(
     cand2  integer            DEFAULT 200
 )
     RETURNS double precision
-AS 'MODULE_PATHNAME', 'linear'
+AS 'MODULE_PATHNAME', 'rrf'
 LANGUAGE C STRICT STABLE;
 
 -- 1) vector + sparsevec
-CREATE FUNCTION linear(
+CREATE FUNCTION rrf(
     emb1   vector,
     op1    regoperator,
     q1     vector,
@@ -956,11 +956,11 @@ CREATE FUNCTION linear(
     cand2  integer            DEFAULT 200
 )
     RETURNS double precision
-AS 'MODULE_PATHNAME', 'linear'
+AS 'MODULE_PATHNAME', 'rrf'
 LANGUAGE C STRICT STABLE;
 
 -- 2) sparsevec + sparsevec
-CREATE FUNCTION linear(
+CREATE FUNCTION rrf(
     emb1   sparsevec,
     op1    regoperator,
     q1     sparsevec,
@@ -974,11 +974,11 @@ CREATE FUNCTION linear(
     cand2  integer            DEFAULT 200
 )
     RETURNS double precision
-AS 'MODULE_PATHNAME', 'linear'
+AS 'MODULE_PATHNAME', 'rrf'
 LANGUAGE C STRICT STABLE;
 
 -- 3) vector + vector
-CREATE FUNCTION linear(
+CREATE FUNCTION rrf(
     emb1   vector,
     op1    regoperator,
     q1     vector,
@@ -992,5 +992,5 @@ CREATE FUNCTION linear(
     cand2  integer            DEFAULT 200
 )
     RETURNS double precision
-AS 'MODULE_PATHNAME', 'linear'
+AS 'MODULE_PATHNAME', 'rrf'
 LANGUAGE C STRICT STABLE;

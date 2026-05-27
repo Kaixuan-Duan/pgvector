@@ -1,4 +1,4 @@
 comment = 'vector data type and ivfflat and hydex access methods'
-default_version = '0.8.0'
+default_version = '0.8.1'
 module_pathname = '$libdir/hybrid_vector'
 relocatable = true

@@ -1,4 +1,4 @@
-/* src/rrf_scan.c */
+/* src/linear_scan.c */
 #include "postgres.h"
 
 #include <string.h>
@@ -37,34 +37,31 @@
 #include "utils/fmgroids.h"
 #include "catalog/indexing.h"
 
-#include "parser/parse_func.h"   /* FuncnameGetCandidates, FuncCandidateList */
-#include "nodes/pg_list.h"       /* List, T_OidList */
+#include "parser/parse_func.h"
+#include "nodes/pg_list.h"
 
-#include "catalog/namespace.h"  /* FuncnameGetCandidates */
+#include "catalog/namespace.h"
 // 添加并行相关代码
 #include "access/parallel.h"
 #include "storage/shm_toc.h"
-#include "rrf_parallel.h"
+#include "linear_parallel.h"
 
 
 extern List *extract_actual_clauses(List *quals, bool pseudoconstant);
 
-void VectorRrfInit(void);
+void VectorLinearInit(void);
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
-static Oid rrf_func_oid = InvalidOid;
-static bool rrf_oids_loaded = false;
-static List *rrf_func_oids = NIL;
+static List *linear_func_oids = NIL;
+static bool linear_func_oids_inited = false;
 
-static bool rrf_func_oids_inited = false;
-
-/* * 全局上下文指针：用于在 CustomScan 执行器和 rrf() 函数之间传递分数。
+/* * 全局上下文指针：用于在 CustomScan 执行器和 linear() 函数之间传递分数。
  * 因为 PG 是单进程模型，在同一个查询执行线程中，这是安全的。
  */
-double *current_rrf_score = NULL;
+double *current_linear_score = NULL;
 
 /* ---------------- Result structs ---------------- */
 
-typedef struct RRFResultItem
+typedef struct LinearResultItem
 {
     ItemPointerData tid;
     float8 score;
@@ -74,10 +71,10 @@ typedef struct RRFResultItem
     int32  r2;
     float8 d1;
     float8 d2;
-} RRFResultItem;
+} LinearResultItem;
 
 /* hash entry 用 tid 做 key */
-typedef struct RRFHashEntry
+typedef struct LinearHashEntry
 {
     uint64 key;            /* (block<<16)|offset */
     ItemPointerData tid;
@@ -86,9 +83,9 @@ typedef struct RRFHashEntry
     float8 d1;
     float8 d2;
     float8 score;
-} RRFHashEntry;
+} LinearHashEntry;
 
-typedef struct VectorRRFScanState
+typedef struct VectorLinearScanState
 {
     CustomScanState css;
 
@@ -126,76 +123,68 @@ typedef struct VectorRRFScanState
     int32 limit;
 
     /* precomputed results */
-    RRFResultItem *results;
+    LinearResultItem *results;
     int nresults;
     int cursor;
 
-    MemoryContext rrf_mcxt;
+    MemoryContext linear_mcxt;
 
     /* heap fetch via index (handles HOT redirects) */
     IndexFetchTableData *fetch;
-} VectorRRFScanState;
+} VectorLinearScanState;
 
 /* ---------------- CustomScan method decls ---------------- */
 
-static Node *vector_rrf_create_scan_state(CustomScan *cscan);
-static void vector_rrf_begin(CustomScanState *node, EState *estate, int eflags);
-static TupleTableSlot *vector_rrf_exec(CustomScanState *node);
-static void vector_rrf_end(CustomScanState *node);
-static void vector_rrf_rescan(CustomScanState *node);
-static void vector_rrf_explain(CustomScanState *node, List *ancestors, ExplainState *es);
+static Node *vector_linear_create_scan_state(CustomScan *cscan);
+static void vector_linear_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *vector_linear_exec(CustomScanState *node);
+static void vector_linear_end(CustomScanState *node);
+static void vector_linear_rescan(CustomScanState *node);
+static void vector_linear_explain(CustomScanState *node, List *ancestors, ExplainState *es);
 
-static CustomScanMethods vector_rrf_scan_methods = {
-    .CustomName = "VectorRRF",
-    .CreateCustomScanState = vector_rrf_create_scan_state
+static CustomScanMethods vector_linear_scan_methods = {
+    .CustomName = "VectorLinear",
+    .CreateCustomScanState = vector_linear_create_scan_state
 };
 
-static CustomExecMethods vector_rrf_exec_methods = {
-    .CustomName = "VectorRRF",
-    .BeginCustomScan = vector_rrf_begin,
-    .ExecCustomScan = vector_rrf_exec,
-    .EndCustomScan = vector_rrf_end,
-    .ReScanCustomScan = vector_rrf_rescan,
-    .ExplainCustomScan = vector_rrf_explain
+static CustomExecMethods vector_linear_exec_methods = {
+    .CustomName = "VectorLinear",
+    .BeginCustomScan = vector_linear_begin,
+    .ExecCustomScan = vector_linear_exec,
+    .EndCustomScan = vector_linear_end,
+    .ReScanCustomScan = vector_linear_rescan,
+    .ExplainCustomScan = vector_linear_explain
 };
 
 static void
-load_rrf_func_oids(void)
+load_linear_func_oids(void)
 {
     MemoryContext oldcxt;
     List *fname;
     FuncCandidateList clist;
 
-    if (rrf_func_oids_inited)
+    if (linear_func_oids_inited)
         return;
 
-    /* 防御：如果被踩坏，不是 OidList，直接丢弃重建 */
-    if (rrf_func_oids != NIL && rrf_func_oids->type != T_OidList)
-        rrf_func_oids = NIL;
+    if (linear_func_oids != NIL && linear_func_oids->type != T_OidList)
+        linear_func_oids = NIL;
 
     oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
-    fname = list_make1(makeString("rrf"));
+    fname = list_make1(makeString("linear"));
 
-
-    /*
-     * PG17: FuncnameGetCandidates() 多了一个参数（通常是 missing_ok）
-     * 这里传 true：找不到也别报错，返回空即可
-     */
     clist = FuncnameGetCandidates(fname,
-                                 -1,    /* nargs */
-                                 NIL,   /* argnames */
-                                 false, /* expand_variadic */
-                                 false, /* expand_defaults */
-                                 false, /* include_out_arguments */
-                                 true   /* missing_ok */
-                                 );
-
+                                  -1,
+                                  NIL,
+                                  false,
+                                  false,
+                                  false,
+                                  true);
 
     for (; clist != NULL; clist = clist->next)
-        rrf_func_oids = lappend_oid(rrf_func_oids, clist->oid);
+        linear_func_oids = lappend_oid(linear_func_oids, clist->oid);
 
-    rrf_func_oids_inited = true;
+    linear_func_oids_inited = true;
 
     MemoryContextSwitchTo(oldcxt);
 }
@@ -204,7 +193,7 @@ load_rrf_func_oids(void)
 
 
 static inline bool
-rrf_funcid_is_rrf(Oid maybe_funcid)
+linear_funcid_is_linear(Oid maybe_funcid)
 {
     if (!OidIsValid(maybe_funcid))
         return false;
@@ -218,48 +207,41 @@ rrf_funcid_is_rrf(Oid maybe_funcid)
         return false;
 #endif
 
-    load_rrf_func_oids();
+    load_linear_func_oids();
 
-    /*
-     * 防御：如果确实没有任何 rrf（例如没在 search_path / 没装扩展），返回 false。
-     */
-    if (rrf_func_oids == NIL)
+    if (linear_func_oids == NIL)
         return false;
 
-    /*
-     * 这里不会再触发 IsOidList，因为我们保证只用 lappend_oid 建 OidList，
-     * 且全程在 TopMemoryContext 分配。
-     */
-    return list_member_oid(rrf_func_oids, maybe_funcid);
+    return list_member_oid(linear_func_oids, maybe_funcid);
 }
 
 
 
 static void
-rrf_assert_expr_type(Expr *e, const char *what)
+linear_assert_expr_type(Expr *e, const char *what)
 {
     Oid t = exprType((Node *) e);
     if (!OidIsValid(t))
         ereport(ERROR,
-                (errmsg("rrf: %s has invalid type Oid=0, node=%s",
+                (errmsg("linear: %s has invalid type Oid=0, node=%s",
                         what, nodeToString(e))));
 }
 
 /* ---------------- CustomPath planning ---------------- */
 
-static Plan *vector_rrf_plan_custom_path(PlannerInfo *root,
+static Plan *vector_linear_plan_custom_path(PlannerInfo *root,
                                          RelOptInfo *rel,
                                          CustomPath *best_path,
                                          List *tlist,
                                          List *clauses,
                                          List *custom_plans);
 
-static CustomPathMethods vector_rrf_path_methods = {
-    .CustomName = "VectorRRF",
-    .PlanCustomPath = vector_rrf_plan_custom_path
+static CustomPathMethods vector_linear_path_methods = {
+    .CustomName = "VectorLinear",
+    .PlanCustomPath = vector_linear_plan_custom_path
 };
 
-/* ---------- Helpers: find rrf() in ORDER BY ---------- */
+/* ---------- Helpers: find linear() in ORDER BY ---------- */
 
 static Expr *
 strip_expr_wrappers(Expr *e)
@@ -292,7 +274,7 @@ make_float8_const(float8 v)
 }
 
 static uint64
-tid_to_key(const ItemPointer tid)
+tid_to_key(const ItemPointerData *tid)
 {
     return (((uint64) ItemPointerGetBlockNumber(tid)) << 16) |
            (uint64) ItemPointerGetOffsetNumber(tid);
@@ -301,10 +283,10 @@ tid_to_key(const ItemPointer tid)
 
 /* 新增：用于双指针合并前，将结果按 TID 物理地址排序 */
 static int
-cmp_rrf_item_by_tid(const void *a, const void *b)
+cmp_linear_item_by_tid(const void *a, const void *b)
 {
-    const RRFResultItem *x = (const RRFResultItem *) a;
-    const RRFResultItem *y = (const RRFResultItem *) b;
+    const LinearResultItem *x = (const LinearResultItem *) a;
+    const LinearResultItem *y = (const LinearResultItem *) b;
     uint64 kx = tid_to_key(&x->tid);
     uint64 ky = tid_to_key(&y->tid);
 
@@ -315,10 +297,10 @@ cmp_rrf_item_by_tid(const void *a, const void *b)
 
 
 static int
-cmp_rrf_item_desc(const void *a, const void *b)
+cmp_linear_item_desc(const void *a, const void *b)
 {
-    const RRFResultItem *x = (const RRFResultItem *) a;
-    const RRFResultItem *y = (const RRFResultItem *) b;
+    const LinearResultItem *x = (const LinearResultItem *) a;
+    const LinearResultItem *y = (const LinearResultItem *) b;
 
     if (x->score > y->score) return -1;
     if (x->score < y->score) return  1;
@@ -349,9 +331,9 @@ find_tle_by_sortgroupref(List *tlist, Index ref)
 }
 
 
-/* Find rrf() in ORDER BY target entry (MVP: single sort key, DESC only) */
+/* Find linear() in ORDER BY target entry (MVP: single sort key, DESC only) */
 static FuncExpr *
-find_rrf_sort_expr(PlannerInfo *root, bool *is_desc_out)
+find_linear_sort_expr(PlannerInfo *root, bool *is_desc_out)
 {
     Query *q = root->parse;
 
@@ -412,9 +394,9 @@ pick_index_for_vars(RelOptInfo *rel, Var *v1, Var *v2, Oid *indexoid_out, int *c
     return false;
 }
 
-/* mutator: replace rrf(...) with Var(INDEX_VAR, score_resno) */
+/* mutator: replace linear(...) with Var(INDEX_VAR, score_resno) */
 static Node *
-replace_rrf_with_score_var_mutator(Node *node, void *ctx)
+replace_linear_with_score_var_mutator(Node *node, void *ctx)
 {
     int score_resno = *((int *) ctx);
 
@@ -425,18 +407,18 @@ replace_rrf_with_score_var_mutator(Node *node, void *ctx)
     {
         FuncExpr *fe = (FuncExpr *) node;
 
-        if (rrf_funcid_is_rrf(fe->funcid))
+        if (linear_funcid_is_linear(fe->funcid))
         {
             return (Node *) makeVar(INDEX_VAR, score_resno, FLOAT8OID, -1, InvalidOid, 0);
         }
 
     }
 
-    return expression_tree_mutator(node, replace_rrf_with_score_var_mutator, ctx);
+    return expression_tree_mutator(node, replace_linear_with_score_var_mutator, ctx);
 }
 
 static List *
-replace_rrf_in_tlist(List *tlist, int score_resno)
+replace_linear_in_tlist(List *tlist, int score_resno)
 {
     List *out = NIL;
     ListCell *lc;
@@ -447,7 +429,7 @@ replace_rrf_in_tlist(List *tlist, int score_resno)
         TargetEntry *ntle = copyObject(tle);
 
         int ctx = score_resno;
-        ntle->expr = (Expr *) replace_rrf_with_score_var_mutator((Node *) ntle->expr, &ctx);
+        ntle->expr = (Expr *) replace_linear_with_score_var_mutator((Node *) ntle->expr, &ctx);
 
         out = lappend(out, ntle);
     }
@@ -455,7 +437,7 @@ replace_rrf_in_tlist(List *tlist, int score_resno)
     return out;
 }
 
-/* Build custom_scan_tlist = all table columns + rrf_score placeholder */
+/* Build custom_scan_tlist = all table columns + linear_score placeholder */
 static List *
 build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score_resno_out)
 {
@@ -463,7 +445,7 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
     RangeTblEntry *rte = (RangeTblEntry *) list_nth(root->parse->rtable, rel->relid - 1);
 
     if (rte == NULL || rte->rtekind != RTE_RELATION)
-        ereport(ERROR, (errmsg("VectorRRF expects a base table RTE")));
+        ereport(ERROR, (errmsg("VectorLinear expects a base table RTE")));
 
     Relation tableRel = table_open(rte->relid, NoLock);
     TupleDesc desc = RelationGetDescr(tableRel);
@@ -508,7 +490,7 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
     int score_resno = natts + 1;
     TargetEntry *score_tle = makeTargetEntry(make_float8_const(0.0),
                                              score_resno,
-                                             pstrdup("rrf_score"),
+                                             pstrdup("linear_score"),
                                              false);
     scan_tlist = lappend(scan_tlist, score_tle);
 
@@ -521,7 +503,7 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
 /* ---------------- Hook: add CustomPath ---------------- */
 
 static void
-vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
+vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
     /* 先让原 hook 跑 */
     if (prev_set_rel_pathlist_hook)
@@ -534,19 +516,19 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
         return;
 
     bool is_desc = false;
-    FuncExpr *fe = find_rrf_sort_expr(root, &is_desc);
+    FuncExpr *fe = find_linear_sort_expr(root, &is_desc);
     if (fe == NULL)
         return;
 
-    if (!rrf_funcid_is_rrf(fe->funcid))
+    if (!linear_funcid_is_linear(fe->funcid))
         return;
 
     if (!is_desc)
-        return; /* RRF score only supports DESC in MVP */
+        return; /* linear score only supports DESC in MVP */
 
     /*
      * New signature:
-     * rrf(emb1, op1, q1, emb2, op2, q2, k?, w1?, w2?, cand1?, cand2?)
+     * linear(emb1, op1, q1, emb2, op2, q2, k?, w1?, w2?, cand1?, cand2?)
      */
     int nargs = list_length(fe->args);
     if (nargs < 6)
@@ -569,10 +551,10 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
         return;
 
     /* 在 append 前检查 */
-    rrf_assert_expr_type(op1, "op1");
-    rrf_assert_expr_type(q1,  "q1");
-    rrf_assert_expr_type(op2, "op2");
-    rrf_assert_expr_type(q2,  "q2");
+    linear_assert_expr_type(op1, "op1");
+    linear_assert_expr_type(q1,  "q1");
+    linear_assert_expr_type(op2, "op2");
+    linear_assert_expr_type(q2,  "q2");
 
     Var *v1 = (Var *) emb1;
     Var *v2 = (Var *) emb2;
@@ -612,7 +594,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
      * 我们直接从系统已经生成的原生路径（比如 SeqScan）里“抄”一个过来。
      */
     /* 【终极修复与调试：处理 Locus 分布特征】 */
-    elog(NOTICE, "[VectorRRF] 准备分配 locus. 当前 rel->pathlist 长度: %d", list_length(rel->pathlist));
+    elog(NOTICE, "[VectorLinear] 准备分配 locus. 当前 rel->pathlist 长度: %d", list_length(rel->pathlist));
 
     if (rel->pathlist != NIL)
     {
@@ -621,17 +603,17 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     }else
     {
         /* 如果真的见鬼了，基础路径为空，抛出明确错误阻断它 */
-        elog(ERROR, "[VectorRRF] 灾难：rel->pathlist 是空的，无法抄作业！");
+        elog(ERROR, "[VectorLinear] 灾难：rel->pathlist 是空的，无法抄作业！");
     }
 
     /* 检查是否依然为空 (0 通常代表 CdbLocusType_Null) */
     if (cpath->path.locus.locustype == 0)
     {
-        elog(ERROR, "[VectorRRF] 抄来的 locus 竟然也是空的！");
+        elog(ERROR, "[VectorLinear] 抄来的 locus 竟然也是空的！");
     }
 
     /* 将装配完整的路径提交给调度中心 */
-    elog(NOTICE, "[VectorRRF] Locus 检查完毕，正式调用 add_path...");
+    elog(NOTICE, "[VectorLinear] Locus 检查完毕，正式调用 add_path...");
 
     /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
     cpath->path.startup_cost = 0;
@@ -645,7 +627,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     cpath->path.parallel_safe = rel->consider_parallel;
     cpath->path.parallel_workers = 0;
 
-    cpath->methods = &vector_rrf_path_methods;
+    cpath->methods = &vector_linear_path_methods;
 
     /* custom_private layout:
      * 0 indexoid
@@ -683,7 +665,7 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
 /* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
 
 static Plan *
-vector_rrf_plan_custom_path(PlannerInfo *root,
+vector_linear_plan_custom_path(PlannerInfo *root,
                             RelOptInfo *rel,
                             CustomPath *best_path,
                             List *tlist,
@@ -692,7 +674,7 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
 {
     CustomScan *cscan = makeNode(CustomScan);
 
-    cscan->methods = &vector_rrf_scan_methods;
+    cscan->methods = &vector_linear_scan_methods;
     cscan->custom_private = NIL;
     cscan->custom_plans = NIL;
     cscan->custom_exprs = NIL;
@@ -720,8 +702,8 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
     int score_resno = 0;
     cscan->custom_scan_tlist = build_custom_scan_tlist_for_table(root, rel, &score_resno);
 
-    /* rewrite rrf(...) in this plan node targetlist to Var(INDEX_VAR, score_resno) */
-    List *rewritten_tlist = replace_rrf_in_tlist(tlist, score_resno);
+    /* rewrite linear(...) in this plan node targetlist to Var(INDEX_VAR, score_resno) */
+    List *rewritten_tlist = replace_linear_in_tlist(tlist, score_resno);
 
     cscan->scan.plan.targetlist = rewritten_tlist;
     cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
@@ -732,16 +714,16 @@ vector_rrf_plan_custom_path(PlannerInfo *root,
 /* ---------- Executor skeleton (MVP: error) ---------- */
 
 static Node *
-vector_rrf_create_scan_state(CustomScan *cscan)
+vector_linear_create_scan_state(CustomScan *cscan)
 {
-    VectorRRFScanState *st = palloc0(sizeof(*st));
+    VectorLinearScanState *st = palloc0(sizeof(*st));
     NodeSetTag(st, T_CustomScanState);
-    st->css.methods = &vector_rrf_exec_methods;
+    st->css.methods = &vector_linear_exec_methods;
     return (Node *) st;
 }
 
 static void
-vector_rrf_eval_params(VectorRRFScanState *st)
+vector_linear_eval_params(VectorLinearScanState *st)
 {
     ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 
@@ -790,12 +772,12 @@ vector_rrf_eval_params(VectorRRFScanState *st)
 }
 
 static void
-vector_rrf_prepare_results(VectorRRFScanState *st)
+vector_linear_prepare_results(VectorLinearScanState *st)
 {
-   MemoryContext old = MemoryContextSwitchTo(st->rrf_mcxt);
+   MemoryContext old = MemoryContextSwitchTo(st->linear_mcxt);
 
     /* evaluate params (op/k/w/cand/limit) */
-    vector_rrf_eval_params(st);
+    vector_linear_eval_params(st);
 
     /* Eval q1/q2 */
     ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
@@ -803,7 +785,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     Datum q1 = ExecEvalExprSwitchContext(st->q1_state, econtext, &isnull1);
     Datum q2 = ExecEvalExprSwitchContext(st->q2_state, econtext, &isnull2);
     if (isnull1 || isnull2)
-        ereport(ERROR, (errmsg("rrf query vector must not be NULL")));
+        ereport(ERROR, (errmsg("linear query vector must not be NULL")));
 
     if (st->cand1 <= 0 || st->cand2 <= 0)
         ereport(ERROR, (errmsg("cand1/cand2 must be > 0")));
@@ -822,7 +804,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
 
     /* ================= 极速双指针合并与归一化打分重构 ================= */
 
-    RRFResultItem *arr1 = palloc0(sizeof(RRFResultItem) * n1);
+    LinearResultItem *arr1 = palloc0(sizeof(LinearResultItem) * n1);
     if (n1 > 0) {
         for (int i = 0; i < n1; i++) {
             arr1[i].tid = list1[i].tid;
@@ -832,7 +814,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
         }
     }
 
-    RRFResultItem *arr2 = palloc0(sizeof(RRFResultItem) * n2);
+    LinearResultItem *arr2 = palloc0(sizeof(LinearResultItem) * n2);
     if (n2 > 0) {
         for (int i = 0; i < n2; i++) {
             arr2[i].tid = list2[i].tid;
@@ -842,11 +824,11 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     }
 
     /* 2. 对两路结果按 TID 进行升序排序（C 语言原生 qsort 极快） */
-    if (n1 > 0) qsort(arr1, n1, sizeof(RRFResultItem), cmp_rrf_item_by_tid);
-    if (n2 > 0) qsort(arr2, n2, sizeof(RRFResultItem), cmp_rrf_item_by_tid);
+    if (n1 > 0) qsort(arr1, n1, sizeof(LinearResultItem), cmp_linear_item_by_tid);
+    if (n2 > 0) qsort(arr2, n2, sizeof(LinearResultItem), cmp_linear_item_by_tid);
 
     /* 3. 使用 O(N) 的双指针 (Sort-Merge Join) 替代沉重的哈希表合并 */
-    RRFResultItem *arr = palloc0(sizeof(RRFResultItem) * (n1 + n2));
+    LinearResultItem *arr = palloc0(sizeof(LinearResultItem) * (n1 + n2));
     int n = 0, p1 = 0, p2 = 0;
 
     while (p1 < n1 && p2 < n2) {
@@ -909,7 +891,7 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
     pfree(arr2);
 
     /* 5. 对最终得分进行排序 + 截断 top LIMIT (保留你原有的逻辑) */
-    qsort(arr, n, sizeof(RRFResultItem), cmp_rrf_item_desc);
+    qsort(arr, n, sizeof(LinearResultItem), cmp_linear_item_desc);
 
     if (st->limit > 0 && n > st->limit)
         n = st->limit;
@@ -923,9 +905,9 @@ vector_rrf_prepare_results(VectorRRFScanState *st)
 }
 
 static void
-vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
+vector_linear_begin(CustomScanState *node, EState *estate, int eflags)
 {
-    VectorRRFScanState *st = (VectorRRFScanState *) node;
+    VectorLinearScanState *st = (VectorLinearScanState *) node;
     CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 
     (void) eflags;
@@ -935,7 +917,7 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
     /* base rel */
     st->heapRel = node->ss.ss_currentRelation;
     if (st->heapRel == NULL)
-        ereport(ERROR, (errmsg("VectorRRF requires ss_currentRelation for base table scan")));
+        ereport(ERROR, (errmsg("VectorLinear requires ss_currentRelation for base table scan")));
 
     /* open index */
     List *priv = cscan->custom_private;
@@ -971,8 +953,8 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
     st->cand2_state = ExecInitExpr(cand2_expr, (PlanState *) node);
 
     /* memory context for precomputed results */
-    st->rrf_mcxt = AllocSetContextCreate(estate->es_query_cxt,
-                                         "vector_rrf_mcxt",
+    st->linear_mcxt = AllocSetContextCreate(estate->es_query_cxt,
+                                         "vector_linear_mcxt",
                                          ALLOCSET_DEFAULT_SIZES);
 
     /* heap fetch slot */
@@ -988,14 +970,14 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
     st->fetch = table_index_fetch_begin(st->heapRel);
 
     /* compute results */
-    MemoryContextReset(st->rrf_mcxt);
-    vector_rrf_prepare_results(st);
+    MemoryContextReset(st->linear_mcxt);
+    vector_linear_prepare_results(st);
 }
 
 static TupleTableSlot *
-vector_rrf_exec(CustomScanState *node)
+vector_linear_exec(CustomScanState *node)
 {
-    VectorRRFScanState *st = (VectorRRFScanState *) node;
+    VectorLinearScanState *st = (VectorLinearScanState *) node;
     ExprContext *econtext = node->ss.ps.ps_ExprContext;
 
     TupleTableSlot *scanSlot   = node->ss.ss_ScanTupleSlot;
@@ -1004,19 +986,19 @@ vector_rrf_exec(CustomScanState *node)
     while (st->cursor < st->nresults)
     {
         int cur = st->cursor;              /* 当前要处理的下标 */
-        RRFResultItem *it = &st->results[st->cursor++];
+        LinearResultItem *it = &st->results[st->cursor++];
 
         /* --- DEBUG: cursor / tid / score --- */
         if (!ItemPointerIsValid(&it->tid))
         {
             elog(WARNING,
-                 "VectorRRF exec: invalid TID at cursor=%d/%d (score=%.6f)",
+                 "VectorLinear exec: invalid TID at cursor=%d/%d (score=%.6f)",
                  cur, st->nresults, it->score);
             continue;
         }
 
         elog(WARNING,
-             "VectorRRF exec: cursor=%d/%d tid=%u/%u score=%.6f",
+             "VectorLinear exec: cursor=%d/%d tid=%u/%u score=%.6f",
              cur, st->nresults,
              ItemPointerGetBlockNumber(&it->tid),
              ItemPointerGetOffsetNumber(&it->tid),
@@ -1049,7 +1031,7 @@ vector_rrf_exec(CustomScanState *node)
         } while (call_again);
 
         elog(WARNING,
-             "VectorRRF exec: index_fetch tid=%u/%u ok=%d all_dead=%d",
+             "VectorLinear exec: index_fetch tid=%u/%u ok=%d all_dead=%d",
              ItemPointerGetBlockNumber(&it->tid),
              ItemPointerGetOffsetNumber(&it->tid),
              (int) ok,
@@ -1061,9 +1043,9 @@ vector_rrf_exec(CustomScanState *node)
 
         /* 1. 设置全局指针 (指向当前结果的 score) */
         /* 注意：这个地址在 st->results 数组释放前都是有效的 */
-        current_rrf_score = &it->score;
+        current_linear_score = &it->score;
         /* Debug 日志: 证明我们设置了 */
-        elog(WARNING, "VectorRRF exec: set global ptr for cursor=%d score=%.6f", st->cursor, it->score);
+        elog(WARNING, "VectorLinear exec: set global ptr for cursor=%d score=%.6f", st->cursor, it->score);
 
         /* fill scanSlot = all heap cols + score (last) */
         ExecClearTuple(scanSlot);
@@ -1075,13 +1057,13 @@ vector_rrf_exec(CustomScanState *node)
         int natts_scan = scanSlot->tts_tupleDescriptor->natts;
 
         elog(WARNING,
-             "VectorRRF exec: natts_heap=%d natts_scan=%d (expect scan=heap+1)",
+             "VectorLinear exec: natts_heap=%d natts_scan=%d (expect scan=heap+1)",
              natts_heap, natts_scan);
 
         /* expect scan = heap + 1 */
         if (natts_scan != natts_heap + 1)
             ereport(ERROR,
-                    (errmsg("VectorRRF scan slot natts=%d does not match heap natts+1=%d",
+                    (errmsg("VectorLinear scan slot natts=%d does not match heap natts+1=%d",
                             natts_scan, natts_heap + 1)));
 
         for (int i = 0; i < natts_heap; i++)
@@ -1100,7 +1082,7 @@ vector_rrf_exec(CustomScanState *node)
         if (node->ss.ps.qual && !ExecQual(node->ss.ps.qual, econtext))
         {
             elog(WARNING,
-                 "VectorRRF exec: qual filtered tid=%u/%u",
+                 "VectorLinear exec: qual filtered tid=%u/%u",
                  ItemPointerGetBlockNumber(&it->tid),
                  ItemPointerGetOffsetNumber(&it->tid));
             continue;
@@ -1111,17 +1093,17 @@ vector_rrf_exec(CustomScanState *node)
         if (node->ss.ps.ps_ProjInfo)
         {
 
-            /* 2. 执行投影。此时 ExecProject 会调用 SQL 中的 rrf() 函数 */
+            /* 2. 执行投影。此时 ExecProject 会调用 SQL 中的 linear() 函数 */
             TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
 
             /* 3. 【用完即焚】调用完必须置空，防止污染其他调用 */
-            /* * [关键修正]：千万不要在这里 current_rrf_score = NULL;
-             * 因为 return out 之后，上层节点(Result Node) 还会立刻再次调用 rrf()！
+            /* * [关键修正]：千万不要在这里 current_linear_score = NULL;
+             * 因为 return out 之后，上层节点(Result Node) 还会立刻再次调用 linear()！
              */
             /* Debug 日志 (可选) */
-            elog(WARNING, "VectorRRF exec: passed score %.6f via global ptr", it->score);
+            elog(WARNING, "VectorLinear exec: passed score %.6f via global ptr", it->score);
             elog(WARNING,
-                 "VectorRRF exec: returned projected tuple for tid=%u/%u",
+                 "VectorLinear exec: returned projected tuple for tid=%u/%u",
                  ItemPointerGetBlockNumber(&it->tid),
                  ItemPointerGetOffsetNumber(&it->tid));
 
@@ -1134,7 +1116,7 @@ vector_rrf_exec(CustomScanState *node)
         // {
         //     TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
         //     elog(WARNING,
-        //          "VectorRRF exec: returned projected tuple for tid=%u/%u",
+        //          "VectorLinear exec: returned projected tuple for tid=%u/%u",
         //          ItemPointerGetBlockNumber(&it->tid),
         //          ItemPointerGetOffsetNumber(&it->tid));
         //     return out;
@@ -1142,26 +1124,26 @@ vector_rrf_exec(CustomScanState *node)
 
         ExecCopySlot(resultSlot, scanSlot);
         elog(WARNING,
-             "VectorRRF exec: returned tuple (no projection) for tid=%u/%u",
+             "VectorLinear exec: returned tuple (no projection) for tid=%u/%u",
              ItemPointerGetBlockNumber(&it->tid),
              ItemPointerGetOffsetNumber(&it->tid));
         return resultSlot;
     }
     /* 3. 只有在扫描结束 (EOF) 时，才清空指针 */
-    // current_rrf_score = NULL;
-    // elog(WARNING, "VectorRRF exec: EOF, cleared global ptr");
+    // current_linear_score = NULL;
+    // elog(WARNING, "VectorLinear exec: EOF, cleared global ptr");
 
-    elog(WARNING, "VectorRRF exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
+    elog(WARNING, "VectorLinear exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
     return NULL;
 }
 
 
 static void
-vector_rrf_end(CustomScanState *node)
+vector_linear_end(CustomScanState *node)
 {
     /* 安全清理 */
-    current_rrf_score = NULL;
-    VectorRRFScanState *st = (VectorRRFScanState *) node;
+    current_linear_score = NULL;
+    VectorLinearScanState *st = (VectorLinearScanState *) node;
 
     if (st->fetch)
         table_index_fetch_end(st->fetch);
@@ -1170,27 +1152,27 @@ vector_rrf_end(CustomScanState *node)
     if (st->indexRel)
         index_close(st->indexRel, AccessShareLock);
 
-    /* rrf_mcxt 挂在 es_query_cxt 下，一般不手动删也行；想严谨可删 */
+    /* linear_mcxt 挂在 es_query_cxt 下，一般不手动删也行；想严谨可删 */
 }
 
 static void
-vector_rrf_rescan(CustomScanState *node)
+vector_linear_rescan(CustomScanState *node)
 {
-    VectorRRFScanState *st = (VectorRRFScanState *) node;
+    VectorLinearScanState *st = (VectorLinearScanState *) node;
 
     /* if params may change, recompute */
-    MemoryContextReset(st->rrf_mcxt);
-    vector_rrf_prepare_results(st);
+    MemoryContextReset(st->linear_mcxt);
+    vector_linear_prepare_results(st);
 }
 
 static void
-vector_rrf_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+vector_linear_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-    VectorRRFScanState *st = (VectorRRFScanState *) node;
+    VectorLinearScanState *st = (VectorLinearScanState *) node;
     CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
     List *priv = cscan->custom_private;
 
-    ExplainPropertyText("VectorRRF", "enabled", es);
+    ExplainPropertyText("VectorLinear", "enabled", es);
 
     if (list_length(priv) >= 3)
     {
@@ -1215,10 +1197,10 @@ vector_rrf_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 /* ---------------- Extension init ---------------- */
 
 void
-VectorRrfInit(void)
+VectorLinearInit(void)
 {
-    RegisterCustomScanMethods(&vector_rrf_scan_methods); /* 注册 CustomScan methods（必须） */
+    RegisterCustomScanMethods(&vector_linear_scan_methods); /* 注册 CustomScan methods（必须） */
 
     prev_set_rel_pathlist_hook = set_rel_pathlist_hook; /* 安装 hook */
-    set_rel_pathlist_hook = vector_rrf_set_rel_pathlist_hook;
+    set_rel_pathlist_hook = vector_linear_set_rel_pathlist_hook;
 }
