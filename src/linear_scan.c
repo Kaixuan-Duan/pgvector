@@ -1,4 +1,3 @@
-/* src/linear_scan.c */
 #include "postgres.h"
 
 #include <string.h>
@@ -41,7 +40,6 @@
 #include "nodes/pg_list.h"
 
 #include "catalog/namespace.h"
-// 添加并行相关代码
 #include "access/parallel.h"
 #include "storage/shm_toc.h"
 #include "linear_parallel.h"
@@ -54,36 +52,17 @@ static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static List *linear_func_oids = NIL;
 static bool linear_func_oids_inited = false;
 
-/* * 全局上下文指针：用于在 CustomScan 执行器和 linear() 函数之间传递分数。
- * 因为 PG 是单进程模型，在同一个查询执行线程中，这是安全的。
- */
 double *current_linear_score = NULL;
-
-/* ---------------- Result structs ---------------- */
 
 typedef struct LinearResultItem
 {
     ItemPointerData tid;
     float8 score;
-
-    /* optional debug */
     int32  r1;
     int32  r2;
     float8 d1;
     float8 d2;
 } LinearResultItem;
-
-/* hash entry 用 tid 做 key */
-typedef struct LinearHashEntry
-{
-    uint64 key;            /* (block<<16)|offset */
-    ItemPointerData tid;
-    int32  r1;
-    int32  r2;
-    float8 d1;
-    float8 d2;
-    float8 score;
-} LinearHashEntry;
 
 typedef struct VectorLinearScanState
 {
@@ -93,13 +72,11 @@ typedef struct VectorLinearScanState
     Relation indexRel;
     Snapshot snapshot;
 
-    TupleTableSlot *heapSlot;   /* for table_tuple_fetch_row_version */
+    TupleTableSlot *heapSlot;
 
-    /* from planner (custom_private) */
-    int col1;   /* 0-based index key position */
+    int col1;
     int col2;
 
-    /* ExprState for parameters */
     ExprState *op1_state;
     ExprState *op2_state;
     ExprState *q1_state;
@@ -111,7 +88,6 @@ typedef struct VectorLinearScanState
     ExprState *cand2_state;
     ExprState *limit_state;
 
-    /* evaluated parameters */
     Oid   op1;
     Oid   op2;
     int32 k_int;
@@ -122,18 +98,14 @@ typedef struct VectorLinearScanState
     int32 cand2;
     int32 limit;
 
-    /* precomputed results */
     LinearResultItem *results;
     int nresults;
     int cursor;
 
     MemoryContext linear_mcxt;
 
-    /* heap fetch via index (handles HOT redirects) */
     IndexFetchTableData *fetch;
 } VectorLinearScanState;
-
-/* ---------------- CustomScan method decls ---------------- */
 
 static Node *vector_linear_create_scan_state(CustomScan *cscan);
 static void vector_linear_begin(CustomScanState *node, EState *estate, int eflags);
@@ -199,10 +171,6 @@ linear_funcid_is_linear(Oid maybe_funcid)
         return false;
 
 #ifdef OPEROID
-    /*
-     * 保险：如果它其实是 operator OID（你之前遇到过），直接返回 false。
-     * （避免把 operator oid 误判成 func oid）
-     */
     if (SearchSysCacheExists1(OPEROID, ObjectIdGetDatum(maybe_funcid)))
         return false;
 #endif
@@ -215,8 +183,6 @@ linear_funcid_is_linear(Oid maybe_funcid)
     return list_member_oid(linear_func_oids, maybe_funcid);
 }
 
-
-
 static void
 linear_assert_expr_type(Expr *e, const char *what)
 {
@@ -226,9 +192,6 @@ linear_assert_expr_type(Expr *e, const char *what)
                 (errmsg("linear: %s has invalid type Oid=0, node=%s",
                         what, nodeToString(e))));
 }
-
-/* ---------------- CustomPath planning ---------------- */
-
 static Plan *vector_linear_plan_custom_path(PlannerInfo *root,
                                          RelOptInfo *rel,
                                          CustomPath *best_path,
@@ -240,8 +203,6 @@ static CustomPathMethods vector_linear_path_methods = {
     .CustomName = "VectorLinear",
     .PlanCustomPath = vector_linear_plan_custom_path
 };
-
-/* ---------- Helpers: find linear() in ORDER BY ---------- */
 
 static Expr *
 strip_expr_wrappers(Expr *e)
@@ -281,7 +242,6 @@ tid_to_key(const ItemPointerData *tid)
 }
 
 
-/* 新增：用于双指针合并前，将结果按 TID 物理地址排序 */
 static int
 cmp_linear_item_by_tid(const void *a, const void *b)
 {
@@ -316,7 +276,6 @@ cmp_linear_item_desc(const void *a, const void *b)
     return 0;
 }
 
-/* 不用 get_sortgroupclause_tle，手工按 tleSortGroupRef 匹配 */
 static TargetEntry *
 find_tle_by_sortgroupref(List *tlist, Index ref)
 {
@@ -331,7 +290,6 @@ find_tle_by_sortgroupref(List *tlist, Index ref)
 }
 
 
-/* Find linear() in ORDER BY target entry (MVP: single sort key, DESC only) */
 static FuncExpr *
 find_linear_sort_expr(PlannerInfo *root, bool *is_desc_out)
 {
@@ -342,10 +300,6 @@ find_linear_sort_expr(PlannerInfo *root, bool *is_desc_out)
 
     SortGroupClause *sgc = linitial_node(SortGroupClause, q->sortClause);
 
-    /*
-     * ORDER BY s1 的 s1 是 targetlist 里的某个 TargetEntry，
-     * 通过 tleSortGroupRef 找到对应的 TLE，然后取 tle->expr。
-     */
     TargetEntry *tle = find_tle_by_sortgroupref(q->targetList, sgc->tleSortGroupRef);
     if (tle == NULL)
         return NULL;
@@ -354,14 +308,11 @@ find_linear_sort_expr(PlannerInfo *root, bool *is_desc_out)
     if (!IsA(expr, FuncExpr))
         return NULL;
 
-    /* MVP：只支持 DESC（你现在的查询就是 DESC） */
     *is_desc_out = true;
 
     return (FuncExpr *) expr;
 }
 
-
-/* pick index + compute key positions */
 static bool
 pick_index_for_vars(RelOptInfo *rel, Var *v1, Var *v2, Oid *indexoid_out, int *col1_out, int *col2_out)
 {
@@ -394,7 +345,6 @@ pick_index_for_vars(RelOptInfo *rel, Var *v1, Var *v2, Oid *indexoid_out, int *c
     return false;
 }
 
-/* mutator: replace linear(...) with Var(INDEX_VAR, score_resno) */
 static Node *
 replace_linear_with_score_var_mutator(Node *node, void *ctx)
 {
@@ -437,11 +387,9 @@ replace_linear_in_tlist(List *tlist, int score_resno)
     return out;
 }
 
-/* Build custom_scan_tlist = all table columns + linear_score placeholder */
 static List *
 build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score_resno_out)
 {
-    /* rel->relid 是 rtable 的 1-based 索引 */
     RangeTblEntry *rte = (RangeTblEntry *) list_nth(root->parse->rtable, rel->relid - 1);
 
     if (rte == NULL || rte->rtekind != RTE_RELATION)
@@ -462,10 +410,6 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
 
         if (att->attisdropped || !OidIsValid(att->atttypid))
         {
-            /*
-             * dropped 列 atttypid=0，不能 makeVar，否则 planner 会 cache lookup type 0
-             * 这里用一个“有类型”的 NULL 占位，并且保持 resno=attno 不变
-             */
             expr = (Expr *) makeNullConst(TEXTOID, -1, InvalidOid);
             colname = pstrdup("dropped");
         }
@@ -485,8 +429,6 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
         scan_tlist = lappend(scan_tlist, tle);
     }
 
-
-    /* last column is score */
     int score_resno = natts + 1;
     TargetEntry *score_tle = makeTargetEntry(make_float8_const(0.0),
                                              score_resno,
@@ -500,16 +442,12 @@ build_custom_scan_tlist_for_table(PlannerInfo *root, RelOptInfo *rel, int *score
     return scan_tlist;
 }
 
-/* ---------------- Hook: add CustomPath ---------------- */
-
 static void
 vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
-    /* 先让原 hook 跑 */
     if (prev_set_rel_pathlist_hook)
         prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
-    /* 只处理简单 base relation */
     if (rte->rtekind != RTE_RELATION)
         return;
     if (rel->reloptkind != RELOPT_BASEREL)
@@ -524,24 +462,14 @@ vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rt
         return;
 
     if (!is_desc)
-        return; /* linear score only supports DESC in MVP */
+        return;
 
-    /*
-     * New signature:
-     * linear(emb1, op1, q1, emb2, op2, q2, k?, w1?, w2?, cand1?, cand2?)
-     */
     int nargs = list_length(fe->args);
     if (nargs < 6)
         return;
 
     Expr *emb1 = strip_expr_wrappers((Expr *) list_nth(fe->args, 0));
-    //Expr *op1  = strip_expr_wrappers((Expr *) list_nth(fe->args, 1));
-    //Expr *q1   = strip_expr_wrappers((Expr *) list_nth(fe->args, 2));
     Expr *emb2 = strip_expr_wrappers((Expr *) list_nth(fe->args, 3));
-    //Expr *op2  = strip_expr_wrappers((Expr *) list_nth(fe->args, 4));
-    //Expr *q2   = strip_expr_wrappers((Expr *) list_nth(fe->args, 5));
-
-    /* op/q 必须保留原始 typed node（不要 strip） */
     Expr *op1  = (Expr *) list_nth(fe->args, 1);
     Expr *q1   = (Expr *) list_nth(fe->args, 2);
     Expr *op2  = (Expr *) list_nth(fe->args, 4);
@@ -550,7 +478,6 @@ vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rt
     if (!IsA(emb1, Var) || !IsA(emb2, Var))
         return;
 
-    /* 在 append 前检查 */
     linear_assert_expr_type(op1, "op1");
     linear_assert_expr_type(q1,  "q1");
     linear_assert_expr_type(op2, "op2");
@@ -559,7 +486,6 @@ vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rt
     Var *v1 = (Var *) emb1;
     Var *v2 = (Var *) emb2;
 
-    /* 两个列必须来自同一张表（同一个 rti） */
     if (v1->varno != rti || v2->varno != rti)
         return;
 
@@ -568,82 +494,48 @@ vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rt
     if (!pick_index_for_vars(rel, v1, v2, &indexoid, &col1, &col2))
         return;
 
-    /* optional args with defaults */
     Expr *k_expr     = (nargs >= 7)  ? (Expr *) list_nth(fe->args, 6)  : make_int4_const(60);
     Expr *w1_expr    = (nargs >= 8)  ? (Expr *) list_nth(fe->args, 7)  : make_float8_const(0.5);
     Expr *w2_expr    = (nargs >= 9)  ? (Expr *) list_nth(fe->args, 8)  : make_float8_const(0.5);
     Expr *cand1_expr = (nargs >= 10) ? (Expr *) list_nth(fe->args, 9)  : make_int4_const(200);
     Expr *cand2_expr = (nargs >= 11) ? (Expr *) list_nth(fe->args, 10) : make_int4_const(200);
 
-    /* LIMIT expr */
     Expr *limit_expr = (root->parse->limitCount != NULL) ?
                        (Expr *) root->parse->limitCount :
                        make_int4_const(0);
 
-    /* build CustomPath */
     CustomPath *cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
     cpath->path.parent = rel;
     cpath->path.param_info = NULL;
     cpath->path.rows = rel->rows;
 
-    /* 必须：否则 create_projection_path 会崩 ！！！！！！！！！！！！ */
     cpath->path.pathtarget = rel->reltarget;
-
-    /* * 【新增修复】：Cloudberry/GPDB MPP 架构必须配置数据的分布特征 (Locus)。
-     * 我们直接从系统已经生成的原生路径（比如 SeqScan）里“抄”一个过来。
-     */
-    /* 【终极修复与调试：处理 Locus 分布特征】 */
-    elog(NOTICE, "[VectorLinear] 准备分配 locus. 当前 rel->pathlist 长度: %d", list_length(rel->pathlist));
 
     if (rel->pathlist != NIL)
     {
         Path *existing_path = (Path *) linitial(rel->pathlist);
         cpath->path.locus = existing_path->locus;
-    }else
+    }
+    else
     {
-        /* 如果真的见鬼了，基础路径为空，抛出明确错误阻断它 */
-        elog(ERROR, "[VectorLinear] 灾难：rel->pathlist 是空的，无法抄作业！");
+        elog(ERROR, "VectorLinear requires a base path with locus");
     }
 
-    /* 检查是否依然为空 (0 通常代表 CdbLocusType_Null) */
     if (cpath->path.locus.locustype == 0)
-    {
-        elog(ERROR, "[VectorLinear] 抄来的 locus 竟然也是空的！");
-    }
+        elog(ERROR, "VectorLinear copied a null locus");
 
-    /* 将装配完整的路径提交给调度中心 */
-    elog(NOTICE, "[VectorLinear] Locus 检查完毕，正式调用 add_path...");
-
-    /* MVP：为了先让 planner 选中它，把 cost 压低；后面再做真实 cost 估算 */
     cpath->path.startup_cost = 0;
     cpath->path.total_cost = 1;
 
-    /* 告诉 planner：我能提供 query 的排序（避免额外 Sort） */
     cpath->path.pathkeys = root->sort_pathkeys;
 
-    /* 避免未初始化字段在 planner 其它分支被用到 */
     cpath->path.parallel_aware = false;
     cpath->path.parallel_safe = rel->consider_parallel;
     cpath->path.parallel_workers = 0;
 
     cpath->methods = &vector_linear_path_methods;
 
-    /* custom_private layout:
-     * 0 indexoid
-     * 1 col1
-     * 2 col2
-     * 3 limit_expr
-     * 4 op1_expr
-     * 5 op2_expr
-     * 6 q1_expr
-     * 7 q2_expr
-     * 8 k_expr
-     * 9 w1_expr
-     * 10 w2_expr
-     * 11 cand1_expr
-     * 12 cand2_expr
-     */
     cpath->custom_private = NIL;
     cpath->custom_private = lappend(cpath->custom_private, makeInteger(indexoid));
     cpath->custom_private = lappend(cpath->custom_private, makeInteger(col1));
@@ -662,8 +554,6 @@ vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rt
     add_path(rel, &cpath->path,root);
 }
 
-/* ---------- PlanCustomPath: CustomPath -> CustomScan ---------- */
-
 static Plan *
 vector_linear_plan_custom_path(PlannerInfo *root,
                             RelOptInfo *rel,
@@ -672,6 +562,8 @@ vector_linear_plan_custom_path(PlannerInfo *root,
                             List *clauses,
                             List *custom_plans)
 {
+    (void) custom_plans;
+
     CustomScan *cscan = makeNode(CustomScan);
 
     cscan->methods = &vector_linear_scan_methods;
@@ -684,25 +576,17 @@ vector_linear_plan_custom_path(PlannerInfo *root,
     foreach(lc, best_path->custom_private)
     {
         if (i < 3)
-        {
-            /* 前 3 个是普通数值 (indexoid, col1, col2)，放入 custom_private */
             cscan->custom_private = lappend(cscan->custom_private, lfirst(lc));
-        }
         else
-        {
-            /* 第 3 个开始全是表达式 (limit, op1, op2, q1, q2 等)，必须放入 custom_exprs */
             cscan->custom_exprs = lappend(cscan->custom_exprs, lfirst(lc));
-        }
         i++;
     }
 
     cscan->scan.scanrelid = rel->relid;
 
-    /* build scan tuple (all columns + score) */
     int score_resno = 0;
     cscan->custom_scan_tlist = build_custom_scan_tlist_for_table(root, rel, &score_resno);
 
-    /* rewrite linear(...) in this plan node targetlist to Var(INDEX_VAR, score_resno) */
     List *rewritten_tlist = replace_linear_in_tlist(tlist, score_resno);
 
     cscan->scan.plan.targetlist = rewritten_tlist;
@@ -711,11 +595,11 @@ vector_linear_plan_custom_path(PlannerInfo *root,
     return &cscan->scan.plan;
 }
 
-/* ---------- Executor skeleton (MVP: error) ---------- */
-
 static Node *
 vector_linear_create_scan_state(CustomScan *cscan)
 {
+    (void) cscan;
+
     VectorLinearScanState *st = palloc0(sizeof(*st));
     NodeSetTag(st, T_CustomScanState);
     st->css.methods = &vector_linear_exec_methods;
@@ -774,12 +658,10 @@ vector_linear_eval_params(VectorLinearScanState *st)
 static void
 vector_linear_prepare_results(VectorLinearScanState *st)
 {
-   MemoryContext old = MemoryContextSwitchTo(st->linear_mcxt);
+    MemoryContext old = MemoryContextSwitchTo(st->linear_mcxt);
 
-    /* evaluate params (op/k/w/cand/limit) */
     vector_linear_eval_params(st);
 
-    /* Eval q1/q2 */
     ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
     bool isnull1 = false, isnull2 = false;
     Datum q1 = ExecEvalExprSwitchContext(st->q1_state, econtext, &isnull1);
@@ -790,107 +672,128 @@ vector_linear_prepare_results(VectorLinearScanState *st)
     if (st->cand1 <= 0 || st->cand2 <= 0)
         ereport(ERROR, (errmsg("cand1/cand2 must be > 0")));
 
-    /* topK arrays */
     HnswTopKItem *list1 = palloc0(sizeof(HnswTopKItem) * st->cand1);
-    // list2会先使用DSM共享内存,如果并行失败则使用本地内存
     HnswTopKItem *list2 = palloc0(sizeof(HnswTopKItem) * st->cand2);
     int n1 = 0, n2 = 0;
 
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col1, st->op1, q1, st->cand1, list1, &n1);
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2, st->cand2, list2, &n2);
 
-    elog(WARNING, "VectorLinear: op1=%u op2=%u cand1=%d cand2=%d n1=%d n2=%d",
-     st->op1, st->op2, st->cand1, st->cand2, n1, n2);
-
-    /* ================= 极速双指针合并与归一化打分重构 ================= */
-
     LinearResultItem *arr1 = palloc0(sizeof(LinearResultItem) * n1);
-    if (n1 > 0) {
-        for (int i = 0; i < n1; i++) {
+    if (n1 > 0)
+    {
+        for (int i = 0; i < n1; i++)
+        {
             arr1[i].tid = list1[i].tid;
             arr1[i].d1  = list1[i].distance;
-            arr1[i].r1  = i + 1; /* 记录原始排名 */
-
+            arr1[i].r1  = i + 1;
         }
     }
 
     LinearResultItem *arr2 = palloc0(sizeof(LinearResultItem) * n2);
-    if (n2 > 0) {
-        for (int i = 0; i < n2; i++) {
+    if (n2 > 0)
+    {
+        for (int i = 0; i < n2; i++)
+        {
             arr2[i].tid = list2[i].tid;
             arr2[i].d2  = list2[i].distance;
-            arr2[i].r2  = i + 1; /* 记录原始排名 */
+            arr2[i].r2  = i + 1;
         }
     }
 
-    /* 2. 对两路结果按 TID 进行升序排序（C 语言原生 qsort 极快） */
-    if (n1 > 0) qsort(arr1, n1, sizeof(LinearResultItem), cmp_linear_item_by_tid);
-    if (n2 > 0) qsort(arr2, n2, sizeof(LinearResultItem), cmp_linear_item_by_tid);
+    if (n1 > 0)
+        qsort(arr1, n1, sizeof(LinearResultItem), cmp_linear_item_by_tid);
+    if (n2 > 0)
+        qsort(arr2, n2, sizeof(LinearResultItem), cmp_linear_item_by_tid);
 
-    /* 3. 使用 O(N) 的双指针 (Sort-Merge Join) 替代沉重的哈希表合并 */
     LinearResultItem *arr = palloc0(sizeof(LinearResultItem) * (n1 + n2));
     int n = 0, p1 = 0, p2 = 0;
 
-    while (p1 < n1 && p2 < n2) {
+    while (p1 < n1 && p2 < n2)
+    {
         uint64 k1 = tid_to_key(&arr1[p1].tid);
         uint64 k2 = tid_to_key(&arr2[p2].tid);
-        if (k1 == k2) {
+        if (k1 == k2)
+        {
             arr[n] = arr1[p1];
             arr[n].r2 = arr2[p2].r2;
             arr[n].d2 = arr2[p2].d2;
-            p1++; p2++;
-        } else if (k1 < k2) {
-            arr[n] = arr1[p1]; arr[n].r2 = 0; p1++;
-        } else {
-            arr[n] = arr2[p2]; arr[n].r1 = 0; p2++;
+            p1++;
+            p2++;
+        }
+        else if (k1 < k2)
+        {
+            arr[n] = arr1[p1];
+            arr[n].r2 = 0;
+            p1++;
+        }
+        else
+        {
+            arr[n] = arr2[p2];
+            arr[n].r1 = 0;
+            p2++;
         }
         n++;
     }
-    while (p1 < n1) { arr[n] = arr1[p1]; arr[n].r2 = 0; p1++; n++; }
-    while (p2 < n2) { arr[n] = arr2[p2]; arr[n].r1 = 0; p2++; n++; }
 
+    while (p1 < n1)
+    {
+        arr[n] = arr1[p1];
+        arr[n].r2 = 0;
+        p1++;
+        n++;
+    }
 
-    /* 3. 一次性获取操作符类型 */
+    while (p2 < n2)
+    {
+        arr[n] = arr2[p2];
+        arr[n].r1 = 0;
+        p2++;
+        n++;
+    }
+
     char *opname1 = get_opname(st->op1);
     char *opname2 = get_opname(st->op2);
     bool is_neg_ip1 = opname1 && strcmp(opname1, "<#>") == 0;
     bool is_neg_ip2 = opname2 && strcmp(opname2, "<#>") == 0;
-    if (opname1) pfree(opname1);
-    if (opname2) pfree(opname2);
+    if (opname1)
+        pfree(opname1);
+    if (opname2)
+        pfree(opname2);
 
-    /* 4. 饱和打分与线性融合 */
     const float8 k_param = (float8)st->k_int;
     const float8 w1 = st->w1;
     const float8 w2 = st->w2;
 
-    /* Tight Loop 纯算术运算 */
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
+    {
         float8 score_sparse = 0.0;
         float8 score_dense = 0.0;
 
-        if (arr[i].r1 > 0) {
+        if (arr[i].r1 > 0)
+        {
             float8 ip_sparse = is_neg_ip1 ? -arr[i].d1 : arr[i].d1;
-            if (ip_sparse < 0) ip_sparse = 0;
-            /* 饱和函数打分：IP / (IP + k) */
+            if (ip_sparse < 0)
+                ip_sparse = 0;
             score_sparse = ip_sparse / (ip_sparse + k_param);
         }
 
-        if (arr[i].r2 > 0) {
+        if (arr[i].r2 > 0)
+        {
             float8 ip_dense = is_neg_ip2 ? -arr[i].d2 : arr[i].d2;
             score_dense = ip_dense;
-            /* 只加分不扣分：max(dot, 0)，并保留归一化上限截断 */
-            if (score_dense < 0.0)  score_dense = 0.0;
-            if (score_dense > 1.0)  score_dense = 1.0;
+            if (score_dense < 0.0)
+                score_dense = 0.0;
+            if (score_dense > 1.0)
+                score_dense = 1.0;
         }
 
         arr[i].score = (w1 * score_sparse) + (w2 * score_dense);
     }
 
-    /* 不再需要 arr1 和 arr2，可以由 MemoryContext 自动清理，也可以手动释放 */
     pfree(arr1);
     pfree(arr2);
 
-    /* 5. 对最终得分进行排序 + 截断 top LIMIT (保留你原有的逻辑) */
     qsort(arr, n, sizeof(LinearResultItem), cmp_linear_item_desc);
 
     if (st->limit > 0 && n > st->limit)
@@ -899,7 +802,6 @@ vector_linear_prepare_results(VectorLinearScanState *st)
     st->results = arr;
     st->nresults = n;
     st->cursor = 0;
-    elog(WARNING, "VectorLinear: st->nresults=%d (Merged with Two-Pointers)", n);
 
     MemoryContextSwitchTo(old);
 }
@@ -914,12 +816,10 @@ vector_linear_begin(CustomScanState *node, EState *estate, int eflags)
 
     st->snapshot = estate->es_snapshot;
 
-    /* base rel */
     st->heapRel = node->ss.ss_currentRelation;
     if (st->heapRel == NULL)
         ereport(ERROR, (errmsg("VectorLinear requires ss_currentRelation for base table scan")));
 
-    /* open index */
     List *priv = cscan->custom_private;
     Oid indexoid = intVal((Node *) list_nth(priv, 0));
     st->col1 = intVal((Node *) list_nth(priv, 1));
@@ -927,7 +827,6 @@ vector_linear_begin(CustomScanState *node, EState *estate, int eflags)
 
     st->indexRel = index_open(indexoid, AccessShareLock);
 
-    /* --- 修改开始：从 custom_exprs 读取所有的表达式 --- */
     List *exprs = cscan->custom_exprs;
 
     Expr *limit_expr  = (Expr *) list_nth(exprs, 0);
@@ -952,24 +851,16 @@ vector_linear_begin(CustomScanState *node, EState *estate, int eflags)
     st->cand1_state = ExecInitExpr(cand1_expr, (PlanState *) node);
     st->cand2_state = ExecInitExpr(cand2_expr, (PlanState *) node);
 
-    /* memory context for precomputed results */
     st->linear_mcxt = AllocSetContextCreate(estate->es_query_cxt,
                                          "vector_linear_mcxt",
                                          ALLOCSET_DEFAULT_SIZES);
 
-    /* heap fetch slot */
     st->heapSlot = ExecInitExtraTupleSlot(estate,
                                           RelationGetDescr(st->heapRel),
                                           &TTSOpsBufferHeapTuple);
 
-    /*
-     * IMPORTANT:
-     * Use index-fetch API so HOT root TIDs can be followed to visible tuple versions
-     * (same behavior as normal IndexScan executor path).
-     */
     st->fetch = table_index_fetch_begin(st->heapRel);
 
-    /* compute results */
     MemoryContextReset(st->linear_mcxt);
     vector_linear_prepare_results(st);
 }
@@ -985,41 +876,21 @@ vector_linear_exec(CustomScanState *node)
 
     while (st->cursor < st->nresults)
     {
-        int cur = st->cursor;              /* 当前要处理的下标 */
         LinearResultItem *it = &st->results[st->cursor++];
 
-        /* --- DEBUG: cursor / tid / score --- */
         if (!ItemPointerIsValid(&it->tid))
-        {
-            elog(WARNING,
-                 "VectorLinear exec: invalid TID at cursor=%d/%d (score=%.6f)",
-                 cur, st->nresults, it->score);
             continue;
-        }
-
-        elog(WARNING,
-             "VectorLinear exec: cursor=%d/%d tid=%u/%u score=%.6f",
-             cur, st->nresults,
-             ItemPointerGetBlockNumber(&it->tid),
-             ItemPointerGetOffsetNumber(&it->tid),
-             it->score);
 
         ExecClearTuple(st->heapSlot);
-
-        /* 1) fetch heap tuple */
 
         bool ok = false;
         bool call_again = false;
         bool all_dead = false;
 
-        /*
-         * Use index fetch path: this follows HOT chains / redirect tuples
-         * and returns the visible version for the snapshot (like IndexScan does).
-         */
-        do {
+        do
+        {
             call_again = false;
             ExecClearTuple(st->heapSlot);
-
 
             ok = table_index_fetch_tuple(st->fetch,
                                          &it->tid,
@@ -1030,37 +901,18 @@ vector_linear_exec(CustomScanState *node)
 
         } while (call_again);
 
-        elog(WARNING,
-             "VectorLinear exec: index_fetch tid=%u/%u ok=%d all_dead=%d",
-             ItemPointerGetBlockNumber(&it->tid),
-             ItemPointerGetOffsetNumber(&it->tid),
-             (int) ok,
-             (int) all_dead);
-
         if (!ok)
             continue;
 
-
-        /* 1. 设置全局指针 (指向当前结果的 score) */
-        /* 注意：这个地址在 st->results 数组释放前都是有效的 */
         current_linear_score = &it->score;
-        /* Debug 日志: 证明我们设置了 */
-        elog(WARNING, "VectorLinear exec: set global ptr for cursor=%d score=%.6f", st->cursor, it->score);
 
-        /* fill scanSlot = all heap cols + score (last) */
         ExecClearTuple(scanSlot);
 
-        /* Ensure heapSlot attrs are extracted */
         slot_getallattrs(st->heapSlot);
 
         int natts_heap = st->heapSlot->tts_tupleDescriptor->natts;
         int natts_scan = scanSlot->tts_tupleDescriptor->natts;
 
-        elog(WARNING,
-             "VectorLinear exec: natts_heap=%d natts_scan=%d (expect scan=heap+1)",
-             natts_heap, natts_scan);
-
-        /* expect scan = heap + 1 */
         if (natts_scan != natts_heap + 1)
             ereport(ERROR,
                     (errmsg("VectorLinear scan slot natts=%d does not match heap natts+1=%d",
@@ -1077,63 +929,16 @@ vector_linear_exec(CustomScanState *node)
 
         ExecStoreVirtualTuple(scanSlot);
 
-        /* qual */
         econtext->ecxt_scantuple = scanSlot;
         if (node->ss.ps.qual && !ExecQual(node->ss.ps.qual, econtext))
-        {
-            elog(WARNING,
-                 "VectorLinear exec: qual filtered tid=%u/%u",
-                 ItemPointerGetBlockNumber(&it->tid),
-                 ItemPointerGetOffsetNumber(&it->tid));
             continue;
-        }
-        /* --- 修改开始 --- */
 
-        /* projection: fill ps_ResultTupleSlot and return */
         if (node->ss.ps.ps_ProjInfo)
-        {
-
-            /* 2. 执行投影。此时 ExecProject 会调用 SQL 中的 linear() 函数 */
-            TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
-
-            /* 3. 【用完即焚】调用完必须置空，防止污染其他调用 */
-            /* * [关键修正]：千万不要在这里 current_linear_score = NULL;
-             * 因为 return out 之后，上层节点(Result Node) 还会立刻再次调用 linear()！
-             */
-            /* Debug 日志 (可选) */
-            elog(WARNING, "VectorLinear exec: passed score %.6f via global ptr", it->score);
-            elog(WARNING,
-                 "VectorLinear exec: returned projected tuple for tid=%u/%u",
-                 ItemPointerGetBlockNumber(&it->tid),
-                 ItemPointerGetOffsetNumber(&it->tid));
-
-            return out;
-        }
-        /* --- 修改结束 --- */
-
-        /* projection: fill ps_ResultTupleSlot and return */
-        // if (node->ss.ps.ps_ProjInfo)
-        // {
-        //     TupleTableSlot *out = ExecProject(node->ss.ps.ps_ProjInfo);
-        //     elog(WARNING,
-        //          "VectorLinear exec: returned projected tuple for tid=%u/%u",
-        //          ItemPointerGetBlockNumber(&it->tid),
-        //          ItemPointerGetOffsetNumber(&it->tid));
-        //     return out;
-        // }
+            return ExecProject(node->ss.ps.ps_ProjInfo);
 
         ExecCopySlot(resultSlot, scanSlot);
-        elog(WARNING,
-             "VectorLinear exec: returned tuple (no projection) for tid=%u/%u",
-             ItemPointerGetBlockNumber(&it->tid),
-             ItemPointerGetOffsetNumber(&it->tid));
         return resultSlot;
     }
-    /* 3. 只有在扫描结束 (EOF) 时，才清空指针 */
-    // current_linear_score = NULL;
-    // elog(WARNING, "VectorLinear exec: EOF, cleared global ptr");
-
-    elog(WARNING, "VectorLinear exec: EOF cursor=%d nresults=%d", st->cursor, st->nresults);
     return NULL;
 }
 
@@ -1141,7 +946,6 @@ vector_linear_exec(CustomScanState *node)
 static void
 vector_linear_end(CustomScanState *node)
 {
-    /* 安全清理 */
     current_linear_score = NULL;
     VectorLinearScanState *st = (VectorLinearScanState *) node;
 
@@ -1151,8 +955,6 @@ vector_linear_end(CustomScanState *node)
 
     if (st->indexRel)
         index_close(st->indexRel, AccessShareLock);
-
-    /* linear_mcxt 挂在 es_query_cxt 下，一般不手动删也行；想严谨可删 */
 }
 
 static void
@@ -1160,7 +962,6 @@ vector_linear_rescan(CustomScanState *node)
 {
     VectorLinearScanState *st = (VectorLinearScanState *) node;
 
-    /* if params may change, recompute */
     MemoryContextReset(st->linear_mcxt);
     vector_linear_prepare_results(st);
 }
@@ -1168,39 +969,16 @@ vector_linear_rescan(CustomScanState *node)
 static void
 vector_linear_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-    VectorLinearScanState *st = (VectorLinearScanState *) node;
-    CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-    List *priv = cscan->custom_private;
-
-    ExplainPropertyText("VectorLinear", "enabled", es);
-
-    if (list_length(priv) >= 3)
-    {
-        ExplainPropertyInteger("index_oid", NULL, intVal((Node *) list_nth(priv, 0)), es);
-        ExplainPropertyInteger("col1", NULL, intVal((Node *) list_nth(priv, 1)), es);
-        ExplainPropertyInteger("col2", NULL, intVal((Node *) list_nth(priv, 2)), es);
-    }
-
-    /* executor-time evaluated params */
-    ExplainPropertyInteger("k", NULL, st->k_int, es);
-    ExplainPropertyFloat("w1", NULL, st->w1, 3, es);
-    ExplainPropertyFloat("w2", NULL, st->w2, 3, es);
-    ExplainPropertyInteger("cand1", NULL, st->cand1, es);
-    ExplainPropertyInteger("cand2", NULL, st->cand2, es);
-    ExplainPropertyInteger("limit", NULL, st->limit, es);
-    ExplainPropertyInteger("op1_oid", NULL, st->op1, es);
-    ExplainPropertyInteger("op2_oid", NULL, st->op2, es);
-
+    (void) node;
     (void) ancestors;
+    (void) es;
 }
-
-/* ---------------- Extension init ---------------- */
 
 void
 VectorLinearInit(void)
 {
-    RegisterCustomScanMethods(&vector_linear_scan_methods); /* 注册 CustomScan methods（必须） */
+    RegisterCustomScanMethods(&vector_linear_scan_methods);
 
-    prev_set_rel_pathlist_hook = set_rel_pathlist_hook; /* 安装 hook */
+    prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
     set_rel_pathlist_hook = vector_linear_set_rel_pathlist_hook;
 }
