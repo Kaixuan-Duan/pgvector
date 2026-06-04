@@ -1,5 +1,5 @@
 EXTENSION = hybrid_vector
-EXTVERSION = 0.8.0
+EXTVERSION = 0.8.1
 
 MODULE_big = hybrid_vector
 DATA = $(wildcard sql/*--*--*.sql)
