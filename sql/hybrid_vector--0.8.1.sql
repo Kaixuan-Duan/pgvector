@@ -40,84 +40,84 @@ CREATE FUNCTION hydex_sparsevec_support(internal) RETURNS internal
 
 CREATE OPERATOR CLASS vector_l2_ops
 	FOR TYPE public.vector USING hydex AS
-	OPERATOR 1 OPERATOR(public.<->) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <-> (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.vector_l2_squared_distance(public.vector, public.vector);
 
 CREATE OPERATOR CLASS vector_ip_ops
 	FOR TYPE public.vector USING hydex AS
-	OPERATOR 1 OPERATOR(public.<#>) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <#> (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.vector_negative_inner_product(public.vector, public.vector);
 
 CREATE OPERATOR CLASS vector_cosine_ops
 	FOR TYPE public.vector USING hydex AS
-	OPERATOR 1 OPERATOR(public.<=>) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <=> (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.vector_negative_inner_product(public.vector, public.vector),
 	FUNCTION 2 public.vector_norm(public.vector);
 
 CREATE OPERATOR CLASS vector_l1_ops
 	FOR TYPE public.vector USING hydex AS
-	OPERATOR 1 OPERATOR(public.<+>) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <+> (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.l1_distance(public.vector, public.vector);
 
 CREATE OPERATOR CLASS halfvec_l2_ops
 	FOR TYPE public.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<->) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <-> (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.halfvec_l2_squared_distance(public.halfvec, public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS halfvec_ip_ops
 	FOR TYPE public.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<#>) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <#> (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.halfvec_negative_inner_product(public.halfvec, public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS halfvec_cosine_ops
 	FOR TYPE public.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<=>) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <=> (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.halfvec_negative_inner_product(public.halfvec, public.halfvec),
 	FUNCTION 2 public.l2_norm(public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS halfvec_l1_ops
 	FOR TYPE public.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<+>) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <+> (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.l1_distance(public.halfvec, public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS bit_hamming_ops
 	FOR TYPE pg_catalog.bit USING hydex AS
-	OPERATOR 1 OPERATOR(public.<~>) (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <~> (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.hamming_distance(pg_catalog.bit, pg_catalog.bit),
 	FUNCTION 3 hydex_bit_support(internal);
 
 CREATE OPERATOR CLASS bit_jaccard_ops
 	FOR TYPE pg_catalog.bit USING hydex AS
-	OPERATOR 1 OPERATOR(public.<%>) (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <%> (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.jaccard_distance(pg_catalog.bit, pg_catalog.bit),
 	FUNCTION 3 hydex_bit_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_l2_ops
 	FOR TYPE public.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<->) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <-> (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.sparsevec_l2_squared_distance(public.sparsevec, public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_ip_ops
 	FOR TYPE public.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<#>) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <#> (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.sparsevec_negative_inner_product(public.sparsevec, public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_cosine_ops
 	FOR TYPE public.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<=>) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <=> (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.sparsevec_negative_inner_product(public.sparsevec, public.sparsevec),
 	FUNCTION 2 public.l2_norm(public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_l1_ops
 	FOR TYPE public.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(public.<+>) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	OPERATOR 1 <+> (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.l1_distance(public.sparsevec, public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
