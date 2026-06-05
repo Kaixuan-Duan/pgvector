@@ -39,97 +39,97 @@ CREATE FUNCTION hydex_sparsevec_support(internal) RETURNS internal
 -- hydex opclasses for pgvector types
 
 CREATE OPERATOR CLASS vector_l2_ops
-	FOR TYPE @extschema:vector@.vector USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<->) (@extschema:vector@.vector, @extschema:vector@.vector) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.vector_l2_squared_distance(@extschema:vector@.vector, @extschema:vector@.vector);
+	FOR TYPE public.vector USING hydex AS
+	OPERATOR 1 OPERATOR(public.<->) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.vector_l2_squared_distance(public.vector, public.vector);
 
 CREATE OPERATOR CLASS vector_ip_ops
-	FOR TYPE @extschema:vector@.vector USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<#>) (@extschema:vector@.vector, @extschema:vector@.vector) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.vector_negative_inner_product(@extschema:vector@.vector, @extschema:vector@.vector);
+	FOR TYPE public.vector USING hydex AS
+	OPERATOR 1 OPERATOR(public.<#>) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.vector_negative_inner_product(public.vector, public.vector);
 
 CREATE OPERATOR CLASS vector_cosine_ops
-	FOR TYPE @extschema:vector@.vector USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<=>) (@extschema:vector@.vector, @extschema:vector@.vector) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.vector_negative_inner_product(@extschema:vector@.vector, @extschema:vector@.vector),
-	FUNCTION 2 @extschema:vector@.vector_norm(@extschema:vector@.vector);
+	FOR TYPE public.vector USING hydex AS
+	OPERATOR 1 OPERATOR(public.<=>) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.vector_negative_inner_product(public.vector, public.vector),
+	FUNCTION 2 public.vector_norm(public.vector);
 
 CREATE OPERATOR CLASS vector_l1_ops
-	FOR TYPE @extschema:vector@.vector USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<+>) (@extschema:vector@.vector, @extschema:vector@.vector) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.l1_distance(@extschema:vector@.vector, @extschema:vector@.vector);
+	FOR TYPE public.vector USING hydex AS
+	OPERATOR 1 OPERATOR(public.<+>) (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.l1_distance(public.vector, public.vector);
 
 CREATE OPERATOR CLASS halfvec_l2_ops
-	FOR TYPE @extschema:vector@.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<->) (@extschema:vector@.halfvec, @extschema:vector@.halfvec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.halfvec_l2_squared_distance(@extschema:vector@.halfvec, @extschema:vector@.halfvec),
+	FOR TYPE public.halfvec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<->) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.halfvec_l2_squared_distance(public.halfvec, public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS halfvec_ip_ops
-	FOR TYPE @extschema:vector@.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<#>) (@extschema:vector@.halfvec, @extschema:vector@.halfvec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.halfvec_negative_inner_product(@extschema:vector@.halfvec, @extschema:vector@.halfvec),
+	FOR TYPE public.halfvec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<#>) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.halfvec_negative_inner_product(public.halfvec, public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS halfvec_cosine_ops
-	FOR TYPE @extschema:vector@.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<=>) (@extschema:vector@.halfvec, @extschema:vector@.halfvec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.halfvec_negative_inner_product(@extschema:vector@.halfvec, @extschema:vector@.halfvec),
-	FUNCTION 2 @extschema:vector@.l2_norm(@extschema:vector@.halfvec),
+	FOR TYPE public.halfvec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<=>) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.halfvec_negative_inner_product(public.halfvec, public.halfvec),
+	FUNCTION 2 public.l2_norm(public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS halfvec_l1_ops
-	FOR TYPE @extschema:vector@.halfvec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<+>) (@extschema:vector@.halfvec, @extschema:vector@.halfvec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.l1_distance(@extschema:vector@.halfvec, @extschema:vector@.halfvec),
+	FOR TYPE public.halfvec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<+>) (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.l1_distance(public.halfvec, public.halfvec),
 	FUNCTION 3 hydex_halfvec_support(internal);
 
 CREATE OPERATOR CLASS bit_hamming_ops
 	FOR TYPE pg_catalog.bit USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<~>) (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.hamming_distance(pg_catalog.bit, pg_catalog.bit),
+	OPERATOR 1 OPERATOR(public.<~>) (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.hamming_distance(pg_catalog.bit, pg_catalog.bit),
 	FUNCTION 3 hydex_bit_support(internal);
 
 CREATE OPERATOR CLASS bit_jaccard_ops
 	FOR TYPE pg_catalog.bit USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<%>) (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.jaccard_distance(pg_catalog.bit, pg_catalog.bit),
+	OPERATOR 1 OPERATOR(public.<%>) (pg_catalog.bit, pg_catalog.bit) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.jaccard_distance(pg_catalog.bit, pg_catalog.bit),
 	FUNCTION 3 hydex_bit_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_l2_ops
-	FOR TYPE @extschema:vector@.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<->) (@extschema:vector@.sparsevec, @extschema:vector@.sparsevec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.sparsevec_l2_squared_distance(@extschema:vector@.sparsevec, @extschema:vector@.sparsevec),
+	FOR TYPE public.sparsevec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<->) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.sparsevec_l2_squared_distance(public.sparsevec, public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_ip_ops
-	FOR TYPE @extschema:vector@.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<#>) (@extschema:vector@.sparsevec, @extschema:vector@.sparsevec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.sparsevec_negative_inner_product(@extschema:vector@.sparsevec, @extschema:vector@.sparsevec),
+	FOR TYPE public.sparsevec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<#>) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.sparsevec_negative_inner_product(public.sparsevec, public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_cosine_ops
-	FOR TYPE @extschema:vector@.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<=>) (@extschema:vector@.sparsevec, @extschema:vector@.sparsevec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.sparsevec_negative_inner_product(@extschema:vector@.sparsevec, @extschema:vector@.sparsevec),
-	FUNCTION 2 @extschema:vector@.l2_norm(@extschema:vector@.sparsevec),
+	FOR TYPE public.sparsevec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<=>) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.sparsevec_negative_inner_product(public.sparsevec, public.sparsevec),
+	FUNCTION 2 public.l2_norm(public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
 CREATE OPERATOR CLASS sparsevec_l1_ops
-	FOR TYPE @extschema:vector@.sparsevec USING hydex AS
-	OPERATOR 1 OPERATOR(@extschema:vector@.<+>) (@extschema:vector@.sparsevec, @extschema:vector@.sparsevec) FOR ORDER BY pg_catalog.float_ops,
-	FUNCTION 1 @extschema:vector@.l1_distance(@extschema:vector@.sparsevec, @extschema:vector@.sparsevec),
+	FOR TYPE public.sparsevec USING hydex AS
+	OPERATOR 1 OPERATOR(public.<+>) (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
+	FUNCTION 1 public.l1_distance(public.sparsevec, public.sparsevec),
 	FUNCTION 3 hydex_sparsevec_support(internal);
 
 -- RRF fusion score function (planner hook / custom scan marker)
 
 CREATE FUNCTION rrf(
-	emb1   @extschema:vector@.sparsevec,
+	emb1   public.sparsevec,
 	op1    pg_catalog.regoperator,
-	q1     @extschema:vector@.sparsevec,
-	emb2   @extschema:vector@.vector,
+	q1     public.sparsevec,
+	emb2   public.vector,
 	op2    pg_catalog.regoperator,
-	q2     @extschema:vector@.vector,
+	q2     public.vector,
 	k      integer            DEFAULT 60,
 	w1     double precision   DEFAULT 0.5,
 	w2     double precision   DEFAULT 0.5,
@@ -141,12 +141,12 @@ AS 'MODULE_PATHNAME', 'rrf'
 LANGUAGE C STRICT STABLE;
 
 CREATE FUNCTION rrf(
-	emb1   @extschema:vector@.vector,
+	emb1   public.vector,
 	op1    pg_catalog.regoperator,
-	q1     @extschema:vector@.vector,
-	emb2   @extschema:vector@.sparsevec,
+	q1     public.vector,
+	emb2   public.sparsevec,
 	op2    pg_catalog.regoperator,
-	q2     @extschema:vector@.sparsevec,
+	q2     public.sparsevec,
 	k      integer            DEFAULT 60,
 	w1     double precision   DEFAULT 0.5,
 	w2     double precision   DEFAULT 0.5,
@@ -158,12 +158,12 @@ AS 'MODULE_PATHNAME', 'rrf'
 LANGUAGE C STRICT STABLE;
 
 CREATE FUNCTION rrf(
-	emb1   @extschema:vector@.sparsevec,
+	emb1   public.sparsevec,
 	op1    pg_catalog.regoperator,
-	q1     @extschema:vector@.sparsevec,
-	emb2   @extschema:vector@.sparsevec,
+	q1     public.sparsevec,
+	emb2   public.sparsevec,
 	op2    pg_catalog.regoperator,
-	q2     @extschema:vector@.sparsevec,
+	q2     public.sparsevec,
 	k      integer            DEFAULT 60,
 	w1     double precision   DEFAULT 0.5,
 	w2     double precision   DEFAULT 0.5,
@@ -175,12 +175,12 @@ AS 'MODULE_PATHNAME', 'rrf'
 LANGUAGE C STRICT STABLE;
 
 CREATE FUNCTION rrf(
-	emb1   @extschema:vector@.vector,
+	emb1   public.vector,
 	op1    pg_catalog.regoperator,
-	q1     @extschema:vector@.vector,
-	emb2   @extschema:vector@.vector,
+	q1     public.vector,
+	emb2   public.vector,
 	op2    pg_catalog.regoperator,
-	q2     @extschema:vector@.vector,
+	q2     public.vector,
 	k      integer            DEFAULT 60,
 	w1     double precision   DEFAULT 0.5,
 	w2     double precision   DEFAULT 0.5,
