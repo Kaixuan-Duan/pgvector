@@ -9,8 +9,9 @@ BEGIN
 	FROM pg_catalog.pg_extension
 	WHERE extname = 'vector';
 
-	IF vector_version IS DISTINCT FROM '0.8.0' THEN
-		RAISE EXCEPTION 'hybrid_vector requires vector extension version 0.8.0, found %',
+	IF vector_version IS NULL OR
+		string_to_array(vector_version, '.')::int[] < string_to_array('0.8.0', '.')::int[] THEN
+		RAISE EXCEPTION 'hybrid_vector requires vector extension >= 0.8.0, found %',
 			COALESCE(vector_version, 'not installed');
 	END IF;
 END
