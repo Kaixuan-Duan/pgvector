@@ -33,7 +33,7 @@ int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
-static relopt_kind hnsw_relopt_kind;
+static relopt_kind hydex_relopt_kind;
 
 /*
  * Assign a tranche ID for our LWLocks. This only needs to be done by one
@@ -51,7 +51,7 @@ HnswInitLockTranche(void)
 	bool		found;
 
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
-	tranche_ids = ShmemInitStruct("hnsw LWLock ids",
+	tranche_ids = ShmemInitStruct("hydex LWLock ids",
 								  sizeof(int) * 1,
 								  &found);
 	if (!found)
@@ -60,53 +60,53 @@ HnswInitLockTranche(void)
 	LWLockRelease(AddinShmemInitLock);
 
 	/* Per-backend registration of the tranche ID */
-	LWLockRegisterTranche(hnsw_lock_tranche_id, "HnswBuild");
+	LWLockRegisterTranche(hnsw_lock_tranche_id, "HydexBuild");
 }
 
 /*
  * Initialize index options and variables
  */
 void
-HnswInit(void)
+HydexInit(void)
 {
 	if (!process_shared_preload_libraries_in_progress)
 		HnswInitLockTranche();
 
-	hnsw_relopt_kind = add_reloption_kind();
-	add_int_reloption(hnsw_relopt_kind, "m", "Max number of connections",
+	hydex_relopt_kind = add_reloption_kind();
+	add_int_reloption(hydex_relopt_kind, "m", "Max number of connections",
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
-	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
+	add_int_reloption(hydex_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
 	// todo dkx
-	add_int_reloption(hnsw_relopt_kind, "m1", "Max number of connections (column 1)",
+	add_int_reloption(hydex_relopt_kind, "m1", "Max number of connections (column 1)",
 					  0, 0, HNSW_MAX_M, AccessExclusiveLock);
-	add_int_reloption(hnsw_relopt_kind, "ef_construction1", "Size of the dynamic candidate list for construction (column 1)",
+	add_int_reloption(hydex_relopt_kind, "ef_construction1", "Size of the dynamic candidate list for construction (column 1)",
 					  0, 0, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
 
-	add_int_reloption(hnsw_relopt_kind, "m2", "Max number of connections (column 2)",
+	add_int_reloption(hydex_relopt_kind, "m2", "Max number of connections (column 2)",
 					  0, 0, HNSW_MAX_M, AccessExclusiveLock);
-	add_int_reloption(hnsw_relopt_kind, "ef_construction2", "Size of the dynamic candidate list for construction (column 2)",
+	add_int_reloption(hydex_relopt_kind, "ef_construction2", "Size of the dynamic candidate list for construction (column 2)",
 					  0, 0, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
 
-	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
+	DefineCustomIntVariable("hydex.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
 							HNSW_DEFAULT_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
 
-	DefineCustomEnumVariable("hnsw.iterative_scan", "Sets the mode for iterative scans",
+	DefineCustomEnumVariable("hydex.iterative_scan", "Sets the mode for iterative scans",
 							 NULL, &hnsw_iterative_scan,
 							 HNSW_ITERATIVE_SCAN_OFF, hnsw_iterative_scan_options, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	/* This is approximate and does not affect the initial scan */
-	DefineCustomIntVariable("hnsw.max_scan_tuples", "Sets the max number of tuples to visit for iterative scans",
+	DefineCustomIntVariable("hydex.max_scan_tuples", "Sets the max number of tuples to visit for iterative scans",
 							NULL, &hnsw_max_scan_tuples,
 							20000, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	/* Same range as hash_mem_multiplier */
-	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
+	DefineCustomRealVariable("hydex.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("hnsw");
+	MarkGUCPrefixReserved("hydex");
 }
 
 /*
@@ -373,7 +373,7 @@ hnswoptions(Datum reloptions, bool validate)
 		{"ef_construction2", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction2)},
 	};
 	HnswOptions *opts = (HnswOptions *) build_reloptions(reloptions, validate,
-													 hnsw_relopt_kind,
+													 hydex_relopt_kind,
 													 sizeof(HnswOptions),
 													 tab, lengthof(tab));
 
@@ -408,7 +408,7 @@ hnswoptions(Datum reloptions, bool validate)
 
 
 	// return (bytea *) build_reloptions(reloptions, validate,
-	// 								  hnsw_relopt_kind,
+	// 								  hydex_relopt_kind,
 	// 								  sizeof(HnswOptions),
 	// 								  tab, lengthof(tab));
 }

@@ -10,7 +10,6 @@
 #include "halfutils.h"
 #include "halfvec.h"
 #include "hnsw.h"
-#include "ivfflat.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
 #include "port.h"				/* for strtof() */
@@ -47,8 +46,7 @@ _PG_init(void)
 {
 	BitvecInit();
 	HalfvecInit();
-	HnswInit();
-	IvfflatInit();
+	HydexInit();
 	VectorLinearInit();
 }
 

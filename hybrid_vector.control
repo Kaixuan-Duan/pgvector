@@ -1,4 +1,5 @@
-comment = 'vector data type and ivfflat and hydex access methods'
+comment = 'hydex access method and RRF search over pgvector types'
 default_version = '0.8.1'
 module_pathname = '$libdir/hybrid_vector'
+requires = 'vector'
 relocatable = true
