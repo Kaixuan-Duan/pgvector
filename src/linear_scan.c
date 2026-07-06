@@ -134,6 +134,7 @@ load_linear_func_oids(void)
     MemoryContext oldcxt;
     List *fname;
     FuncCandidateList clist;
+    char *funcnames[] = {"linear", "rrf"};
 
     if (linear_func_oids_inited)
         return;
@@ -143,18 +144,24 @@ load_linear_func_oids(void)
 
     oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
-    fname = list_make1(makeString("linear"));
+    for (int i = 0; i < 2; i++)
+    {
+        fname = list_make1(makeString(funcnames[i]));
 
-    clist = FuncnameGetCandidates(fname,
-                                  -1,
-                                  NIL,
-                                  false,
-                                  false,
-                                  false,
-                                  true);
+        clist = FuncnameGetCandidates(fname,
+                                      -1,
+                                      NIL,
+                                      false,
+                                      false,
+                                      false,
+                                      true);
 
-    for (; clist != NULL; clist = clist->next)
-        linear_func_oids = lappend_oid(linear_func_oids, clist->oid);
+        for (; clist != NULL; clist = clist->next)
+        {
+            if (!list_member_oid(linear_func_oids, clist->oid))
+                linear_func_oids = lappend_oid(linear_func_oids, clist->oid);
+        }
+    }
 
     linear_func_oids_inited = true;
 

@@ -191,3 +191,73 @@ CREATE FUNCTION linear(
 	RETURNS double precision
 AS 'MODULE_PATHNAME', 'linear'
 LANGUAGE C STRICT STABLE;
+
+-- RRF-compatible fusion score function (same VectorLinear implementation)
+
+CREATE FUNCTION rrf(
+	emb1   public.sparsevec,
+	op1    pg_catalog.regoperator,
+	q1     public.sparsevec,
+	emb2   public.vector,
+	op2    pg_catalog.regoperator,
+	q2     public.vector,
+	k      integer            DEFAULT 60,
+	w1     double precision   DEFAULT 0.5,
+	w2     double precision   DEFAULT 0.5,
+	cand1  integer            DEFAULT 200,
+	cand2  integer            DEFAULT 200
+)
+	RETURNS double precision
+AS 'MODULE_PATHNAME', 'linear'
+LANGUAGE C STRICT STABLE;
+
+CREATE FUNCTION rrf(
+	emb1   public.vector,
+	op1    pg_catalog.regoperator,
+	q1     public.vector,
+	emb2   public.sparsevec,
+	op2    pg_catalog.regoperator,
+	q2     public.sparsevec,
+	k      integer            DEFAULT 60,
+	w1     double precision   DEFAULT 0.5,
+	w2     double precision   DEFAULT 0.5,
+	cand1  integer            DEFAULT 200,
+	cand2  integer            DEFAULT 200
+)
+	RETURNS double precision
+AS 'MODULE_PATHNAME', 'linear'
+LANGUAGE C STRICT STABLE;
+
+CREATE FUNCTION rrf(
+	emb1   public.sparsevec,
+	op1    pg_catalog.regoperator,
+	q1     public.sparsevec,
+	emb2   public.sparsevec,
+	op2    pg_catalog.regoperator,
+	q2     public.sparsevec,
+	k      integer            DEFAULT 60,
+	w1     double precision   DEFAULT 0.5,
+	w2     double precision   DEFAULT 0.5,
+	cand1  integer            DEFAULT 200,
+	cand2  integer            DEFAULT 200
+)
+	RETURNS double precision
+AS 'MODULE_PATHNAME', 'linear'
+LANGUAGE C STRICT STABLE;
+
+CREATE FUNCTION rrf(
+	emb1   public.vector,
+	op1    pg_catalog.regoperator,
+	q1     public.vector,
+	emb2   public.vector,
+	op2    pg_catalog.regoperator,
+	q2     public.vector,
+	k      integer            DEFAULT 60,
+	w1     double precision   DEFAULT 0.5,
+	w2     double precision   DEFAULT 0.5,
+	cand1  integer            DEFAULT 200,
+	cand2  integer            DEFAULT 200
+)
+	RETURNS double precision
+AS 'MODULE_PATHNAME', 'linear'
+LANGUAGE C STRICT STABLE;
