@@ -201,6 +201,10 @@ HnswInitNormalizeSupport(HnswSupport *support, Relation index, AttrNumber attno)
 {
 	Oid			inputType;
 	Oid			normalizeOid;
+	Oid			returnType;
+	Oid		  *argtypes;
+	int			nargs;
+	bool			validSignature;
 	List	   *funcname;
 
 	support->hasNormalize = false;
@@ -217,9 +221,12 @@ HnswInitNormalizeSupport(HnswSupport *support, Relation index, AttrNumber attno)
 		list_free_deep(funcname);
 	}
 
-	if (get_func_nargs(normalizeOid) != 1 ||
-		get_func_argtype(normalizeOid, 0) != inputType ||
-		get_func_rettype(normalizeOid) != inputType)
+	returnType = get_func_signature(normalizeOid, &argtypes, &nargs);
+	validSignature = nargs == 1 && argtypes[0] == inputType &&
+		returnType == inputType;
+	pfree(argtypes);
+
+	if (!validSignature)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("hydex normalization function has incompatible signature"),
