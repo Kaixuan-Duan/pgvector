@@ -202,14 +202,21 @@ GetScanValue(IndexScanDesc scan)
 	else
 	{
 		value = scan->orderByData->sk_argument;
+		elog(NOTICE, "hydex linear diagnostic: scan value argument received");
 
 		/* Value should not be compressed or toasted */
 		Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(value)));
 		Assert(!VARATT_IS_EXTENDED(DatumGetPointer(value)));
+		elog(NOTICE, "hydex linear diagnostic: scan value argument verified");
 
 		/* Normalize if needed */
 		if (so->support.normprocinfo != NULL)
+		{
+			elog(NOTICE, "hydex linear diagnostic: scan value normalize start oid=%u",
+				 so->support.normalizeprocinfo.fn_oid);
 			value = HnswNormValue(&so->support, value);
+			elog(NOTICE, "hydex linear diagnostic: scan value normalize complete");
+		}
 	}
 
 	return value;
