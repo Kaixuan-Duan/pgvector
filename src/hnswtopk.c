@@ -55,6 +55,9 @@ HnswTopKForColumn(Relation heapRel,
                  errmsg("orderby operator OID is invalid"),
                  errhint("Pass the operator OID from the ORDER BY distance operator (e.g. <->, <#>, <=>).")));
 
+    elog(NOTICE, "hydex linear diagnostic: top-k enter column=%d index=%u topk=%d",
+         col, RelationGetRelid(indexRel), topk);
+
     Oid orderby_proc = get_opcode(orderby_op);
     if (!OidIsValid(orderby_proc))
         ereport(ERROR,
@@ -68,6 +71,7 @@ HnswTopKForColumn(Relation heapRel,
                  errmsg("no active snapshot")));
 
     scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
+    elog(NOTICE, "hydex linear diagnostic: top-k scan opened column=%d", col);
     if (scan->numberOfOrderBys > 0)
     {
         scan->xs_orderbyvals = (Datum *) palloc0(sizeof(Datum) * scan->numberOfOrderBys);
@@ -85,16 +89,22 @@ HnswTopKForColumn(Relation heapRel,
                            query);
 
     index_rescan(scan, NULL, 0, &orderbykey, 1);
+    elog(NOTICE, "hydex linear diagnostic: top-k scan rescanned column=%d", col);
 
 #ifdef HNSW_HAVE_SCAN_SET_COLUMN
     HnswScanSetColumn(scan, col);
 #endif
+    elog(NOTICE, "hydex linear diagnostic: top-k scan ready column=%d", col);
 
     IndexFetchTableData *fetch = table_index_fetch_begin(heapRel);
     TupleTableSlot *slot = table_slot_create(heapRel, NULL);
 
     while (n < topk)
     {
+        if ((n % 16) == 0)
+            elog(NOTICE, "hydex linear diagnostic: top-k before next-tid column=%d candidate=%d",
+                 col, n);
+
         bool found = index_getnext_tid(scan, ForwardScanDirection);
         if (!found)
             break;
@@ -113,7 +123,15 @@ HnswTopKForColumn(Relation heapRel,
             Datum val = slot_getattr(slot, heap_attnum, &isnull);
 
             if (!isnull)
+            {
+                if ((n % 16) == 0)
+                    elog(NOTICE, "hydex linear diagnostic: top-k before distance column=%d candidate=%d",
+                         col, n);
                 out[n].distance = DatumGetFloat8(OidFunctionCall2Coll(orderby_proc, InvalidOid, val, query));
+                if ((n % 16) == 0)
+                    elog(NOTICE, "hydex linear diagnostic: top-k after distance column=%d candidate=%d",
+                         col, n);
+            }
             else
                 out[n].distance = 0.0;
 
@@ -124,6 +142,9 @@ HnswTopKForColumn(Relation heapRel,
 
         n++;
     }
+
+    elog(NOTICE, "hydex linear diagnostic: top-k candidate loop complete column=%d results=%d",
+         col, n);
 
     ExecDropSingleTupleTableSlot(slot);
     table_index_fetch_end(fetch);
