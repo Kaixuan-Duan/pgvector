@@ -20,6 +20,7 @@
 #include "optimizer/planner.h"
 #include "parser/parse_clause.h"
 #include "utils/builtins.h"
+#include "utils/errcodes.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -92,6 +93,9 @@ typedef struct RRFHashEntry
 typedef struct VectorRRFScanState
 {
     CustomScanState css;
+
+    /* EXPLAIN initializes a CustomScanState but must not execute RRF. */
+    bool explain_only;
 
     Relation heapRel;
     Relation indexRel;
@@ -298,6 +302,50 @@ make_float8_const(float8 v)
 {
     return (Expr *) makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
                               Float8GetDatum(v), false, true);
+}
+
+static bool
+rrf_contains_relation_reference_walker(Node *node, void *context)
+{
+    (void) context;
+
+    if (node == NULL)
+        return false;
+
+    if (IsA(node, Var) || IsA(node, SubLink))
+        return true;
+
+    return expression_tree_walker(node, rrf_contains_relation_reference_walker,
+                                  context);
+}
+
+static bool
+rrf_contains_relation_reference(Expr *expr)
+{
+    return rrf_contains_relation_reference_walker((Node *) expr, NULL);
+}
+
+static void
+rrf_reject_relation_arguments(Expr *op1, Expr *q1,
+                              Expr *op2, Expr *q2,
+                              Expr *k, Expr *w1, Expr *w2,
+                              Expr *cand1, Expr *cand2, Expr *limit)
+{
+    if (rrf_contains_relation_reference(op1) ||
+        rrf_contains_relation_reference(q1) ||
+        rrf_contains_relation_reference(op2) ||
+        rrf_contains_relation_reference(q2) ||
+        rrf_contains_relation_reference(k) ||
+        rrf_contains_relation_reference(w1) ||
+        rrf_contains_relation_reference(w2) ||
+        rrf_contains_relation_reference(cand1) ||
+        rrf_contains_relation_reference(cand2) ||
+        rrf_contains_relation_reference(limit))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("rrf() CustomScan does not support relation-dependent arguments"),
+                 errdetail("Query vectors, operators, k, weights, candidate counts, and LIMIT must not reference a relation."),
+                 errhint("Use literals or prepared-statement parameters instead of CTE, subquery, or join values.")));
 }
 
 static uint64
@@ -590,6 +638,10 @@ vector_rrf_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rti, 
     Expr *limit_expr = (root->parse->limitCount != NULL) ?
                        (Expr *) root->parse->limitCount :
                        make_int4_const(0);
+
+    rrf_reject_relation_arguments(op1, q1, op2, q2,
+                                  k_expr, w1_expr, w2_expr,
+                                  cand1_expr, cand2_expr, limit_expr);
 
     /* build CustomPath */
     CustomPath *cpath = makeNode(CustomPath);
@@ -1287,7 +1339,9 @@ vector_rrf_begin(CustomScanState *node, EState *estate, int eflags)
     VectorRRFScanState *st = (VectorRRFScanState *) node;
     CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 
-    (void) eflags;
+    st->explain_only = (eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0;
+    if (st->explain_only)
+        return;
 
     st->snapshot = estate->es_snapshot;
 
@@ -1353,6 +1407,10 @@ static TupleTableSlot *
 vector_rrf_exec(CustomScanState *node)
 {
     VectorRRFScanState *st = (VectorRRFScanState *) node;
+
+    if (st->explain_only)
+        return NULL;
+
     ExprContext *econtext = node->ss.ps.ps_ExprContext;
 
     TupleTableSlot *scanSlot   = node->ss.ss_ScanTupleSlot;
@@ -1526,6 +1584,9 @@ vector_rrf_end(CustomScanState *node)
     current_rrf_score = NULL;
     VectorRRFScanState *st = (VectorRRFScanState *) node;
 
+    if (st->explain_only)
+        return;
+
     if (st->fetch)
         table_index_fetch_end(st->fetch);
     st->fetch = NULL;
@@ -1540,6 +1601,9 @@ static void
 vector_rrf_rescan(CustomScanState *node)
 {
     VectorRRFScanState *st = (VectorRRFScanState *) node;
+
+    if (st->explain_only)
+        return;
 
     /* if params may change, recompute */
     MemoryContextReset(st->rrf_mcxt);
@@ -1562,15 +1626,20 @@ vector_rrf_explain(CustomScanState *node, List *ancestors, ExplainState *es)
         ExplainPropertyInteger("col2", NULL, intVal((Node *) list_nth(priv, 2)), es);
     }
 
-    /* executor-time evaluated params */
-    ExplainPropertyInteger("k", NULL, st->k_int, es);
-    ExplainPropertyFloat("w1", NULL, st->w1, 3, es);
-    ExplainPropertyFloat("w2", NULL, st->w2, 3, es);
-    ExplainPropertyInteger("cand1", NULL, st->cand1, es);
-    ExplainPropertyInteger("cand2", NULL, st->cand2, es);
-    ExplainPropertyInteger("limit", NULL, st->limit, es);
-    ExplainPropertyInteger("op1_oid", NULL, st->op1, es);
-    ExplainPropertyInteger("op2_oid", NULL, st->op2, es);
+    if (st->explain_only)
+        ExplainPropertyText("execution", "skipped (EXPLAIN only)", es);
+    else
+    {
+        /* executor-time evaluated params */
+        ExplainPropertyInteger("k", NULL, st->k_int, es);
+        ExplainPropertyFloat("w1", NULL, st->w1, 3, es);
+        ExplainPropertyFloat("w2", NULL, st->w2, 3, es);
+        ExplainPropertyInteger("cand1", NULL, st->cand1, es);
+        ExplainPropertyInteger("cand2", NULL, st->cand2, es);
+        ExplainPropertyInteger("limit", NULL, st->limit, es);
+        ExplainPropertyInteger("op1_oid", NULL, st->op1, es);
+        ExplainPropertyInteger("op2_oid", NULL, st->op2, es);
+    }
 
     (void) ancestors;
 }

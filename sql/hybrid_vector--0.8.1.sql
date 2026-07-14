@@ -10,8 +10,9 @@ BEGIN
 	WHERE extname = 'vector';
 
 	IF vector_version IS NULL OR
-		string_to_array(vector_version, '.')::int[] < string_to_array('0.8.0', '.')::int[] THEN
-		RAISE EXCEPTION 'hybrid_vector requires vector extension >= 0.8.0, found %',
+		string_to_array(vector_version, '.')::int[] < string_to_array('0.8.0', '.')::int[] OR
+		string_to_array(vector_version, '.')::int[] >= string_to_array('0.9.0', '.')::int[] THEN
+		RAISE EXCEPTION 'hybrid_vector requires vector extension >= 0.8.0 and < 0.9.0, found %',
 			COALESCE(vector_version, 'not installed');
 	END IF;
 END
@@ -53,7 +54,8 @@ CREATE OPERATOR CLASS vector_cosine_ops
 	FOR TYPE public.vector USING hydex AS
 	OPERATOR 1 <=> (public.vector, public.vector) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.vector_negative_inner_product(public.vector, public.vector),
-	FUNCTION 2 public.vector_norm(public.vector);
+	FUNCTION 2 public.vector_norm(public.vector),
+	FUNCTION 4 public.l2_normalize(public.vector);
 
 CREATE OPERATOR CLASS vector_l1_ops
 	FOR TYPE public.vector USING hydex AS
@@ -77,7 +79,8 @@ CREATE OPERATOR CLASS halfvec_cosine_ops
 	OPERATOR 1 <=> (public.halfvec, public.halfvec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.halfvec_negative_inner_product(public.halfvec, public.halfvec),
 	FUNCTION 2 public.l2_norm(public.halfvec),
-	FUNCTION 3 hydex_halfvec_support(internal);
+	FUNCTION 3 hydex_halfvec_support(internal),
+	FUNCTION 4 public.l2_normalize(public.halfvec);
 
 CREATE OPERATOR CLASS halfvec_l1_ops
 	FOR TYPE public.halfvec USING hydex AS
@@ -114,7 +117,8 @@ CREATE OPERATOR CLASS sparsevec_cosine_ops
 	OPERATOR 1 <=> (public.sparsevec, public.sparsevec) FOR ORDER BY pg_catalog.float_ops,
 	FUNCTION 1 public.sparsevec_negative_inner_product(public.sparsevec, public.sparsevec),
 	FUNCTION 2 public.l2_norm(public.sparsevec),
-	FUNCTION 3 hydex_sparsevec_support(internal);
+	FUNCTION 3 hydex_sparsevec_support(internal),
+	FUNCTION 4 public.l2_normalize(public.sparsevec);
 
 CREATE OPERATOR CLASS sparsevec_l1_ops
 	FOR TYPE public.sparsevec USING hydex AS

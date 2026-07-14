@@ -4,8 +4,7 @@ EXTVERSION = 0.8.1
 MODULE_big = hybrid_vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
-OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o src/rrf.o src/rrf_scan.o src/hnswtopk.o src/rrf_parallel.o
-HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
+OBJS = src/module.o src/pgvector_compat.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/rrf.o src/rrf_scan.o src/hnswtopk.o src/rrf_parallel.o
 
 TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
@@ -31,6 +30,12 @@ endif
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
 PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+
+# Keep hydex's private HNSW helpers bound to this shared object when pgvector's
+# vector.so is loaded in the same backend. Darwin does not support this ELF flag.
+ifneq ($(shell uname -s),Darwin)
+	PG_LDFLAGS += -Wl,-Bsymbolic
+endif
 
 # Debug GCC auto-vectorization
 # PG_CFLAGS += -fopt-info-vec

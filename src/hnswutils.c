@@ -9,9 +9,13 @@
 #include "fmgr.h"
 #include "hnsw.h"
 #include "lib/pairingheap.h"
-#include "sparsevec.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_func.h"
 #include "storage/bufmgr.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/errcodes.h"
+#include "utils/lsyscache.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 
@@ -189,6 +193,47 @@ HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum)
 	return index_getprocinfo(index, attno, procnum);
 }
 
+static void
+HnswInitNormalizeSupport(HnswSupport *support, Relation index, AttrNumber attno)
+{
+	Oid			inputType;
+	Oid			normalizeOid;
+	Oid			returnType;
+	Oid		   *argtypes;
+	int			nargs;
+	bool			validSignature;
+	List		   *funcname;
+
+	support->normalizeproc = InvalidOid;
+
+	if (support->normprocinfo == NULL)
+		return;
+
+	inputType = index->rd_opcintype[attno - 1];
+	normalizeOid = index_getprocid(index, attno, HNSW_NORMALIZE_PROC);
+	if (!OidIsValid(normalizeOid))
+	{
+		funcname = list_make2(makeString("public"), makeString("l2_normalize"));
+		normalizeOid = LookupFuncName(funcname, 1, &inputType, false);
+		list_free_deep(funcname);
+	}
+
+	returnType = get_func_signature(normalizeOid, &argtypes, &nargs);
+	validSignature = nargs == 1 && argtypes[0] == inputType &&
+		returnType == inputType;
+	pfree(argtypes);
+
+	if (!validSignature)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("hydex normalization function has incompatible signature"),
+				 errdetail("Expected one %s argument and a %s return type.",
+						   format_type_be(inputType), format_type_be(inputType))));
+
+	/* Resolve pgvector's function through fmgr at invocation time. */
+	support->normalizeproc = normalizeOid;
+}
+
 /*
  * Init support functions
  */
@@ -198,6 +243,7 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+	HnswInitNormalizeSupport(support, index, 1);
 }
 
 void
@@ -208,22 +254,30 @@ HnswInitSupportColumn(HnswSupport *support, Relation index, int col)
 	support->procinfo = index_getprocinfo(index, attno, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[col];
 	support->normprocinfo = HnswOptionalProcInfoColumn(index, col, HNSW_NORM_PROC);
+	HnswInitNormalizeSupport(support, index, attno);
 }
 
 /*
  * Normalize value
  */
 Datum
-HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value)
+HydexNormValue(HnswSupport *support, Datum value)
 {
-	return DirectFunctionCall1Coll(typeInfo->normalize, collation, value);
+	Oid			normalizeOid = support->normalizeproc;
+
+	if (!OidIsValid(normalizeOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("hydex normalization support function is not available")));
+
+	return OidFunctionCall1Coll(normalizeOid, support->collation, value);
 }
 
 /*
  * Check if non-zero norm
  */
-bool
-HnswCheckNorm(HnswSupport * support, Datum value)
+static bool
+HydexCheckNorm(HnswSupport *support, Datum value)
 {
 	return DatumGetFloat8(FunctionCall1Coll(support->normprocinfo, support->collation, value)) > 0;
 }
@@ -784,10 +838,10 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 	/* Normalize if needed */
 	if (support->normprocinfo != NULL)
 	{
-		if (!HnswCheckNorm(support, value))
+		if (!HydexCheckNorm(support, value))
 			return false;
 
-		value = HnswNormValue(typeInfo, support->collation, value);
+		value = HydexNormValue(support, value);
 	}
 
 	*out = value;
@@ -1719,21 +1773,6 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	}
 }
 
-PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum halfvec_l2_normalize(PG_FUNCTION_ARGS);
-PGDLLEXPORT Datum sparsevec_l2_normalize(PG_FUNCTION_ARGS);
-
-static void
-SparsevecCheckValue(Pointer v)
-{
-	SparseVector *vec = (SparseVector *) v;
-
-	if (vec->nnz > HNSW_MAX_NNZ)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("sparsevec cannot have more than %d non-zero elements for hnsw index", HNSW_MAX_NNZ)));
-}
-
 /*
  * Get type info
  */
@@ -1746,7 +1785,6 @@ HnswGetTypeInfo(Relation index)
 	{
 		static const HnswTypeInfo typeInfo = {
 			.maxDimensions = HNSW_MAX_DIM,
-			.normalize = l2_normalize,
 			.checkValue = NULL
 		};
 
@@ -1765,7 +1803,6 @@ HnswGetTypeInfoColumn(Relation index, int col)
 	{
 		static const HnswTypeInfo typeInfo = {
 			.maxDimensions = HNSW_MAX_DIM,
-			.normalize = l2_normalize,
 			.checkValue = NULL
 		};
 
@@ -1774,42 +1811,3 @@ HnswGetTypeInfoColumn(Relation index, int col)
 	else
 		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));
 }
-
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_support);
-Datum
-hnsw_halfvec_support(PG_FUNCTION_ARGS)
-{
-	static const HnswTypeInfo typeInfo = {
-		.maxDimensions = HNSW_MAX_DIM * 2,
-		.normalize = halfvec_l2_normalize,
-		.checkValue = NULL
-	};
-
-	PG_RETURN_POINTER(&typeInfo);
-};
-
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_bit_support);
-Datum
-hnsw_bit_support(PG_FUNCTION_ARGS)
-{
-	static const HnswTypeInfo typeInfo = {
-		.maxDimensions = HNSW_MAX_DIM * 32,
-		.normalize = NULL,
-		.checkValue = NULL
-	};
-
-	PG_RETURN_POINTER(&typeInfo);
-};
-
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_sparsevec_support);
-Datum
-hnsw_sparsevec_support(PG_FUNCTION_ARGS)
-{
-	static const HnswTypeInfo typeInfo = {
-		.maxDimensions = SPARSEVEC_MAX_DIM,
-		.normalize = sparsevec_l2_normalize,
-		.checkValue = SparsevecCheckValue
-	};
-
-	PG_RETURN_POINTER(&typeInfo);
-};
