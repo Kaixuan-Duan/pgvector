@@ -71,12 +71,16 @@ GetScanItemsColumn(IndexScanDesc scan, Datum value, int col)
 	char *base = NULL;
 	HnswQuery *q = &so->q;
 
+	elog(NOTICE, "hydex linear diagnostic: graph search enter column=%d", col);
+
 	/*
 	 * 关键差异：按列读取 m / entryPoint
 	 * - 旧布局时 HnswGetMetaPageInfoMulti(col=0) 会兼容
 	 * - 新布局时会取 graphs[col]
 	 */
 	HnswGetMetaPageInfoMulti(index, col, &m, &entryPoint);
+	elog(NOTICE, "hydex linear diagnostic: graph metadata read column=%d m=%d entry=%s",
+		 col, m, entryPoint == NULL ? "none" : "present");
 
 	q->value = value;
 	so->m = m;
@@ -84,6 +88,7 @@ GetScanItemsColumn(IndexScanDesc scan, Datum value, int col)
 	if (entryPoint == NULL)
 		return NIL;
 
+	elog(NOTICE, "hydex linear diagnostic: graph entry candidate column=%d", col);
 	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)
@@ -97,6 +102,8 @@ GetScanItemsColumn(IndexScanDesc scan, Datum value, int col)
 		ep = w;
 	}
 
+	elog(NOTICE, "hydex linear diagnostic: graph ground search column=%d ef=%d",
+		 col, hnsw_ef_search);
 	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0,
 						   index, support, m,
 						   false,
@@ -976,6 +983,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
     Assert(ScanDirectionIsForward(dir));
 
     /* Safety check */
+    elog(NOTICE, "hydex linear diagnostic: multi gettuple enter");
     if (scan->orderByData == NULL)
         elog(ERROR, "cannot scan hnsw index without order");
 
@@ -985,6 +993,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
 
     /* 关键：从 orderByData 决定当前列（0-based） */
     col = HnswGetOrderByCol(scan);
+    elog(NOTICE, "hydex linear diagnostic: multi gettuple selected column=%d", col);
 
     if (col < 0 || col >= soMulti->nkeys)
         elog(ERROR, "hnsw scan col out of range: col=%d nkeys=%d", col, soMulti->nkeys);
@@ -1006,6 +1015,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
          * 关键修复：GetScanValue 仍然是“单列假设”，
          * 所以这里临时把 scan->opaque 切到当前列 so。
          */
+        elog(NOTICE, "hydex linear diagnostic: multi gettuple read query column=%d", col);
         PG_TRY();
         {
             scan->opaque = (void *) so;          /* 单列 opaque */
@@ -1018,6 +1028,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
             PG_RE_THROW();
         }
         PG_END_TRY();
+        elog(NOTICE, "hydex linear diagnostic: multi gettuple query ready column=%d", col);
 
         /*
          * Get a shared lock. This allows vacuum to ensure no in-flight scans
@@ -1026,7 +1037,10 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
         LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
         /* 关键改动 1：按列取 scan items（scan->opaque 仍是 Multi） */
+        elog(NOTICE, "hydex linear diagnostic: multi gettuple build candidates column=%d", col);
         so->w = GetScanItemsColumn(scan, value, col);
+        elog(NOTICE, "hydex linear diagnostic: multi gettuple candidates ready column=%d count=%d",
+             col, list_length(so->w));
 
         UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
