@@ -12,8 +12,10 @@
 #include "nodes/makefuncs.h"
 #include "parser/parse_func.h"
 #include "storage/bufmgr.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/errcodes.h"
+#include "utils/lsyscache.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 
@@ -194,69 +196,62 @@ HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum)
 /*
  * Init support functions
  */
-void
-HnswInitSupport(HnswSupport * support, Relation index)
+static void
+HnswInitNormalizeSupport(HnswSupport *support, Relation index, AttrNumber attno)
 {
-	FmgrInfo   *normalizeprocinfo;
 	Oid			inputType;
 	Oid			normalizeOid;
 	List	   *funcname;
 
-	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
-	support->collation = index->rd_indcollation[0];
-	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
 	support->hasNormalize = false;
 
 	if (support->normprocinfo == NULL)
 		return;
 
-	normalizeprocinfo = HnswOptionalProcInfo(index, HNSW_NORMALIZE_PROC);
-	if (normalizeprocinfo != NULL)
+	inputType = index->rd_opcintype[attno - 1];
+	normalizeOid = index_getprocid(index, attno, HNSW_NORMALIZE_PROC);
+	if (!OidIsValid(normalizeOid))
 	{
-		support->normalizeprocinfo = *normalizeprocinfo;
-		support->hasNormalize = true;
-		return;
+		funcname = list_make2(makeString("public"), makeString("l2_normalize"));
+		normalizeOid = LookupFuncName(funcname, 1, &inputType, false);
+		list_free_deep(funcname);
 	}
 
-	inputType = index->rd_opcintype[0];
-	funcname = list_make2(makeString("public"), makeString("l2_normalize"));
-	normalizeOid = LookupFuncName(funcname, 1, &inputType, false);
-	list_free_deep(funcname);
+	if (get_func_nargs(normalizeOid) != 1 ||
+		get_func_argtype(normalizeOid, 0) != inputType ||
+		get_func_rettype(normalizeOid) != inputType)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("hydex normalization function has incompatible signature"),
+				 errdetail("Expected one %s argument and a %s return type.",
+						   format_type_be(inputType), format_type_be(inputType))));
+
+	/*
+	 * Do not copy the FmgrInfo cached in the relcache.  This scan owns its
+	 * function state and can safely call into pgvector through fmgr.
+	 */
 	fmgr_info(normalizeOid, &support->normalizeprocinfo);
 	support->hasNormalize = true;
 }
 
 void
+HnswInitSupport(HnswSupport * support, Relation index)
+{
+	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
+	support->collation = index->rd_indcollation[0];
+	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+	HnswInitNormalizeSupport(support, index, 1);
+}
+
+void
 HnswInitSupportColumn(HnswSupport *support, Relation index, int col)
 {
-	AttrNumber attno = (AttrNumber) (col + 1); /* 1-based */
-	FmgrInfo   *normalizeprocinfo;
-	Oid			inputType;
-	Oid			normalizeOid;
-	List	   *funcname;
+	AttrNumber attno = (AttrNumber) (col + 1);
 
 	support->procinfo = index_getprocinfo(index, attno, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[col];
 	support->normprocinfo = HnswOptionalProcInfoColumn(index, col, HNSW_NORM_PROC);
-	support->hasNormalize = false;
-
-	if (support->normprocinfo == NULL)
-		return;
-
-	normalizeprocinfo = HnswOptionalProcInfoColumn(index, col, HNSW_NORMALIZE_PROC);
-	if (normalizeprocinfo != NULL)
-	{
-		support->normalizeprocinfo = *normalizeprocinfo;
-		support->hasNormalize = true;
-		return;
-	}
-
-	inputType = index->rd_opcintype[col];
-	funcname = list_make2(makeString("public"), makeString("l2_normalize"));
-	normalizeOid = LookupFuncName(funcname, 1, &inputType, false);
-	list_free_deep(funcname);
-	fmgr_info(normalizeOid, &support->normalizeprocinfo);
-	support->hasNormalize = true;
+	HnswInitNormalizeSupport(support, index, attno);
 }
 
 /*

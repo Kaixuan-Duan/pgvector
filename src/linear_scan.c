@@ -19,6 +19,7 @@
 #include "optimizer/planner.h"
 #include "parser/parse_clause.h"
 #include "utils/builtins.h"
+#include "utils/errcodes.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -105,6 +106,8 @@ typedef struct VectorLinearScanState
     MemoryContext linear_mcxt;
 
     IndexFetchTableData *fetch;
+
+    bool explain_only;
 } VectorLinearScanState;
 
 static Node *vector_linear_create_scan_state(CustomScan *cscan);
@@ -225,6 +228,28 @@ strip_expr_wrappers(Expr *e)
         else
             return e;
     }
+}
+
+static void
+linear_reject_relation_arguments(Expr *op1, Expr *q1, Expr *op2, Expr *q2,
+                                 Expr *limit_expr, Expr *k_expr, Expr *w1_expr,
+                                 Expr *w2_expr, Expr *cand1_expr, Expr *cand2_expr)
+{
+    if (contain_var_clause((Node *) op1) ||
+        contain_var_clause((Node *) q1) ||
+        contain_var_clause((Node *) op2) ||
+        contain_var_clause((Node *) q2) ||
+        contain_var_clause((Node *) limit_expr) ||
+        contain_var_clause((Node *) k_expr) ||
+        contain_var_clause((Node *) w1_expr) ||
+        contain_var_clause((Node *) w2_expr) ||
+        contain_var_clause((Node *) cand1_expr) ||
+        contain_var_clause((Node *) cand2_expr))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("linear()/rrf() arguments must not reference a relation"),
+                 errdetail("Use literals or parameters for query vectors and tuning arguments."),
+                 errhint("CTE, subquery, and join references are not supported by VectorLinear CustomScan.")));
 }
 
 static Expr *
@@ -510,6 +535,10 @@ vector_linear_set_rel_pathlist_hook(PlannerInfo *root, RelOptInfo *rel, Index rt
     Expr *limit_expr = (root->parse->limitCount != NULL) ?
                        (Expr *) root->parse->limitCount :
                        make_int4_const(0);
+
+    linear_reject_relation_arguments(op1, q1, op2, q2, limit_expr,
+                                     k_expr, w1_expr, w2_expr,
+                                     cand1_expr, cand2_expr);
 
     CustomPath *cpath = makeNode(CustomPath);
     cpath->path.pathtype = T_CustomScan;
@@ -819,7 +848,9 @@ vector_linear_begin(CustomScanState *node, EState *estate, int eflags)
     VectorLinearScanState *st = (VectorLinearScanState *) node;
     CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 
-    (void) eflags;
+    st->explain_only = (eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0;
+    if (st->explain_only)
+        return;
 
     st->snapshot = estate->es_snapshot;
 
@@ -877,6 +908,9 @@ vector_linear_exec(CustomScanState *node)
 {
     VectorLinearScanState *st = (VectorLinearScanState *) node;
     ExprContext *econtext = node->ss.ps.ps_ExprContext;
+
+    if (st->explain_only)
+        return NULL;
 
     TupleTableSlot *scanSlot   = node->ss.ss_ScanTupleSlot;
     TupleTableSlot *resultSlot = node->ss.ps.ps_ResultTupleSlot;
@@ -968,6 +1002,9 @@ static void
 vector_linear_rescan(CustomScanState *node)
 {
     VectorLinearScanState *st = (VectorLinearScanState *) node;
+
+    if (st->explain_only)
+        return;
 
     MemoryContextReset(st->linear_mcxt);
     vector_linear_prepare_results(st);
