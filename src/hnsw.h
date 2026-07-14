@@ -486,8 +486,7 @@ FmgrInfo   *HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum);
 
 void		HnswInitSupport(HnswSupport * support, Relation index);
 void		HnswInitSupportColumn(HnswSupport *support, Relation index, int col);
-Datum		HnswNormValue(HnswSupport * support, Datum value);
-bool		HnswCheckNorm(HnswSupport * support, Datum value);
+Datum		HydexNormValue(HnswSupport *support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HydexInit(void);

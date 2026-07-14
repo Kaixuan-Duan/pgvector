@@ -31,6 +31,12 @@ endif
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
 PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 
+# Keep hydex's internal HNSW calls bound to this module when vector.so is loaded.
+# -Bsymbolic is an ELF linker option and must not be passed to the macOS linker.
+ifneq ($(shell uname -s),Darwin)
+PG_LDFLAGS += -Wl,-Bsymbolic
+endif
+
 # Debug GCC auto-vectorization
 # PG_CFLAGS += -fopt-info-vec
 

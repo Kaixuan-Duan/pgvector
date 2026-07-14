@@ -261,7 +261,7 @@ HnswInitSupportColumn(HnswSupport *support, Relation index, int col)
  * Normalize value
  */
 Datum
-HnswNormValue(HnswSupport * support, Datum value)
+HydexNormValue(HnswSupport *support, Datum value)
 {
 	Oid			normalizeOid = support->normalizeproc;
 
@@ -278,8 +278,8 @@ HnswNormValue(HnswSupport * support, Datum value)
 /*
  * Check if non-zero norm
  */
-bool
-HnswCheckNorm(HnswSupport * support, Datum value)
+static bool
+HydexCheckNorm(HnswSupport *support, Datum value)
 {
 	return DatumGetFloat8(FunctionCall1Coll(support->normprocinfo, support->collation, value)) > 0;
 }
@@ -840,10 +840,10 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 	/* Normalize if needed */
 	if (support->normprocinfo != NULL)
 	{
-		if (!HnswCheckNorm(support, value))
+		if (!HydexCheckNorm(support, value))
 			return false;
 
-		value = HnswNormValue(support, value);
+		value = HydexNormValue(support, value);
 	}
 
 	*out = value;
