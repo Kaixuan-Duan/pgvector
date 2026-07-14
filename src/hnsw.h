@@ -10,7 +10,7 @@
 #include "port.h"				/* for random() */
 #include "utils/relptr.h"
 #include "utils/sampling.h"
-#include "vector.h"
+#include "pgvector_compat.h"
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
@@ -19,6 +19,7 @@
 #define HNSW_DISTANCE_PROC 1
 #define HNSW_NORM_PROC 2
 #define HNSW_TYPE_INFO_PROC 3
+#define HNSW_NORMALIZE_PROC 4
 
 #define HNSW_VERSION	1
 #define HNSW_VERSION_MULTI  2
@@ -257,7 +258,6 @@ typedef struct HnswAllocator
 typedef struct HnswTypeInfo
 {
 	int			maxDimensions;
-	Datum		(*normalize) (PG_FUNCTION_ARGS);
 	void		(*checkValue) (Pointer v);
 }			HnswTypeInfo;
 
@@ -265,6 +265,8 @@ typedef struct HnswSupport
 {
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
+	FmgrInfo	normalizeprocinfo;
+	bool		hasNormalize;
 	Oid			collation;
 }			HnswSupport;
 
@@ -484,7 +486,7 @@ FmgrInfo   *HnswOptionalProcInfoColumn(Relation index, int col, uint16 procnum);
 
 void		HnswInitSupport(HnswSupport * support, Relation index);
 void		HnswInitSupportColumn(HnswSupport *support, Relation index, int col);
-Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
+Datum		HnswNormValue(HnswSupport * support, Datum value);
 bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);

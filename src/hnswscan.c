@@ -202,7 +202,7 @@ GetScanValue(IndexScanDesc scan)
 
 		/* Normalize if needed */
 		if (so->support.normprocinfo != NULL)
-			value = HnswNormValue(so->typeInfo, so->support.collation, value);
+			value = HnswNormValue(&so->support, value);
 	}
 
 	return value;
