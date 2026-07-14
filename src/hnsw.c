@@ -434,7 +434,8 @@ hnswhandler(PG_FUNCTION_ARGS)
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
 	amroutine->amstrategies = 0;
-	amroutine->amsupport = 3;
+	/* Slot 4 is hydex's pgvector l2_normalize support function. */
+	amroutine->amsupport = HNSW_NORMALIZE_PROC;
 	amroutine->amoptsprocnum = 0;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = true;
