@@ -213,7 +213,7 @@ GetScanValue(IndexScanDesc scan)
 		if (so->support.normprocinfo != NULL)
 		{
 			elog(NOTICE, "hydex linear diagnostic: scan value normalize start oid=%u",
-				 so->support.normalizeprocinfo.fn_oid);
+				 so->support.normalizeproc);
 			value = HnswNormValue(&so->support, value);
 			elog(NOTICE, "hydex linear diagnostic: scan value normalize complete");
 		}

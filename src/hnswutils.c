@@ -207,7 +207,7 @@ HnswInitNormalizeSupport(HnswSupport *support, Relation index, AttrNumber attno)
 	bool			validSignature;
 	List	   *funcname;
 
-	support->hasNormalize = false;
+	support->normalizeproc = InvalidOid;
 
 	if (support->normprocinfo == NULL)
 		return;
@@ -233,12 +233,8 @@ HnswInitNormalizeSupport(HnswSupport *support, Relation index, AttrNumber attno)
 				 errdetail("Expected one %s argument and a %s return type.",
 						   format_type_be(inputType), format_type_be(inputType))));
 
-	/*
-	 * Do not copy the FmgrInfo cached in the relcache.  This scan owns its
-	 * function state and can safely call into pgvector through fmgr.
-	 */
-	fmgr_info(normalizeOid, &support->normalizeprocinfo);
-	support->hasNormalize = true;
+	/* Resolve pgvector's function through fmgr at invocation time. */
+	support->normalizeproc = normalizeOid;
 }
 
 void
@@ -267,19 +263,16 @@ HnswInitSupportColumn(HnswSupport *support, Relation index, int col)
 Datum
 HnswNormValue(HnswSupport * support, Datum value)
 {
-	if (!support->hasNormalize)
+	Oid			normalizeOid = support->normalizeproc;
+
+	if (!OidIsValid(normalizeOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("hydex normalization support function is not available")));
 
 	elog(NOTICE, "hydex linear diagnostic: normalize fmgr call oid=%u",
-		 support->normalizeprocinfo.fn_oid);
-	Datum result = FunctionCall1Coll(&support->normalizeprocinfo,
-								 support->collation, value);
-	elog(NOTICE, "hydex linear diagnostic: normalize fmgr return oid=%u",
-		 support->normalizeprocinfo.fn_oid);
-
-	return result;
+		 normalizeOid);
+	return OidFunctionCall1Coll(normalizeOid, support->collation, value);
 }
 
 /*

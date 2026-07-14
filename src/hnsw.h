@@ -265,8 +265,8 @@ typedef struct HnswSupport
 {
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
-	FmgrInfo	normalizeprocinfo;
-	bool		hasNormalize;
+	/* pgvector owns the function implementation; hydex caches only its OID. */
+	Oid			normalizeproc;
 	Oid			collation;
 }			HnswSupport;
 
