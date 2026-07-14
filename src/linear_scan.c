@@ -230,26 +230,51 @@ strip_expr_wrappers(Expr *e)
     }
 }
 
+/*
+ * Cloudberry 2.0 is based on PostgreSQL 14 and does not expose
+ * contain_var_clause().  Keep the CustomScan eligibility check local so its
+ * meaning does not depend on a version-specific planner helper.
+ */
+static bool
+linear_contains_var_walker(Node *node, void *context)
+{
+	(void) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+		return true;
+
+	return expression_tree_walker(node, linear_contains_var_walker, context);
+}
+
+static bool
+linear_contains_relation_reference(Expr *expr)
+{
+	return linear_contains_var_walker((Node *) expr, NULL);
+}
+
 static void
 linear_reject_relation_arguments(Expr *op1, Expr *q1, Expr *op2, Expr *q2,
                                  Expr *limit_expr, Expr *k_expr, Expr *w1_expr,
                                  Expr *w2_expr, Expr *cand1_expr, Expr *cand2_expr)
 {
-    if (contain_var_clause((Node *) op1) ||
-        contain_var_clause((Node *) q1) ||
-        contain_var_clause((Node *) op2) ||
-        contain_var_clause((Node *) q2) ||
-        contain_var_clause((Node *) limit_expr) ||
-        contain_var_clause((Node *) k_expr) ||
-        contain_var_clause((Node *) w1_expr) ||
-        contain_var_clause((Node *) w2_expr) ||
-        contain_var_clause((Node *) cand1_expr) ||
-        contain_var_clause((Node *) cand2_expr))
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("linear()/rrf() arguments must not reference a relation"),
-                 errdetail("Use literals or parameters for query vectors and tuning arguments."),
-                 errhint("CTE, subquery, and join references are not supported by VectorLinear CustomScan.")));
+	if (linear_contains_relation_reference(op1) ||
+		linear_contains_relation_reference(q1) ||
+		linear_contains_relation_reference(op2) ||
+		linear_contains_relation_reference(q2) ||
+		linear_contains_relation_reference(limit_expr) ||
+		linear_contains_relation_reference(k_expr) ||
+		linear_contains_relation_reference(w1_expr) ||
+		linear_contains_relation_reference(w2_expr) ||
+		linear_contains_relation_reference(cand1_expr) ||
+		linear_contains_relation_reference(cand2_expr))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("linear()/rrf() arguments must not reference a relation"),
+				 errdetail("Use literals or parameters for query vectors and tuning arguments."),
+				 errhint("CTE, subquery, and join references are not supported by VectorLinear CustomScan.")));
 }
 
 static Expr *
