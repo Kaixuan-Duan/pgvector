@@ -45,6 +45,7 @@
 #include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/pg_type_d.h"
+#include "cdb/cdbvars.h"
 #include "commands/progress.h"
 #include "hnsw.h"
 #include "miscadmin.h"
@@ -1420,7 +1421,7 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	/* Enter parallel mode and create context */
 	EnterParallelMode();
 	Assert(request > 0);
-	pcxt = CreateParallelContext("vector", "HnswParallelBuildMain", request);
+	pcxt = CreateParallelContext("hybrid_vector", "HnswParallelBuildMain", request);
 
 	/* Get snapshot for table scan */
 	if (!isconcurrent)
@@ -1544,6 +1545,14 @@ static int
 ComputeParallelWorkers(Relation heap, Relation index)
 {
 	int			parallel_workers;
+
+	/*
+	 * Do not launch local parallel index workers on the QD or AO tables.
+	 * Segment/QE parallel builds remain enabled.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH ||
+		AMHandlerIsAO(heap->rd_amhandler))
+		return 0;
 
 	/* Make sure it's safe to use parallel workers */
 	parallel_workers = plan_create_index_workers(RelationGetRelid(heap), RelationGetRelid(index));
