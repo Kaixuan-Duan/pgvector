@@ -352,6 +352,7 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->discarded = NULL;
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
+	so->lastDistanceValid = false;
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -399,6 +400,7 @@ hnswrescanmulti(IndexScanDesc scan, ScanKey keys, int nkeys,
 		so->discarded = NULL;
 		so->tuples = 0;
 		so->previousDistance = -get_float8_infinity();
+		so->lastDistanceValid = false;
 		MemoryContextReset(so->tmpCtx);
 	}
 
@@ -432,6 +434,8 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
+	so->lastDistanceValid = false;
 
 	/*
 	 * Index can be used to scan backward, but Postgres doesn't support
@@ -557,6 +561,8 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		MemoryContextSwitchTo(oldCtx);
 
+		so->lastDistance = sc->distance;
+		so->lastDistanceValid = true;
 		scan->xs_heaptid = *heaptid;
 		scan->xs_recheck = false;
 		scan->xs_recheckorderby = false;
@@ -993,6 +999,7 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
 
     /* 当前列的单列 opaque */
     so = &soMulti->cols[col];
+    so->lastDistanceValid = false;
 
     oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
@@ -1114,6 +1121,8 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
 
         MemoryContextSwitchTo(oldCtx);
 
+        so->lastDistance = sc->distance;
+        so->lastDistanceValid = true;
         scan->xs_heaptid = *heaptid;
         scan->xs_recheck = false;
         scan->xs_recheckorderby = false;
@@ -1122,6 +1131,40 @@ hnswgettuplemulti_single(IndexScanDesc scan, ScanDirection dir)
 
     MemoryContextSwitchTo(oldCtx);
     return false;
+}
+
+bool
+HnswGetLastDistance(IndexScanDesc scan, int col, double *distance)
+{
+	HnswScanOpaque so;
+	int			nkeys;
+
+	if (scan == NULL || distance == NULL)
+		return false;
+
+	nkeys = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
+	if (nkeys <= 1)
+	{
+		if (col != 0)
+			return false;
+
+		so = (HnswScanOpaque) scan->opaque;
+	}
+	else
+	{
+		HnswScanOpaqueMulti soMulti = (HnswScanOpaqueMulti) scan->opaque;
+
+		if (col < 0 || col >= soMulti->nkeys)
+			return false;
+
+		so = &soMulti->cols[col];
+	}
+
+	if (!so->lastDistanceValid)
+		return false;
+
+	*distance = so->lastDistance;
+	return true;
 }
 
 

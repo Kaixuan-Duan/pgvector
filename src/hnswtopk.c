@@ -10,6 +10,7 @@
 
 #include "utils/snapmgr.h"
 #include <math.h>
+#include "hnsw.h"
 #include "hnswtopk.h"
 
 #include "utils/lsyscache.h"
@@ -56,10 +57,31 @@ HnswTopKForColumn(Relation heapRel,
                  errhint("Pass the operator OID from the ORDER BY distance operator (e.g. <->, <#>, <=>).")));
 
     Oid orderby_proc = get_opcode(orderby_op);
+    Oid distance_proc;
+    Oid norm_proc;
+    Oid commutator_op;
+    bool can_reuse_distance;
+
     if (!OidIsValid(orderby_proc))
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("orderby operator OID %u has no underlying procedure", orderby_op)));
+
+    distance_proc = index_getprocid(indexRel,
+                                    (AttrNumber) (col + 1),
+                                    HNSW_DISTANCE_PROC);
+    norm_proc = index_getprocid(indexRel,
+                                (AttrNumber) (col + 1),
+                                HNSW_NORM_PROC);
+    commutator_op = get_commutator(orderby_op);
+    /*
+     * The graph-search distance has the SQL operator's numeric semantics only
+     * when both paths call the same commutative function on unnormalized data.
+     */
+    can_reuse_distance = OidIsValid(distance_proc) &&
+                         distance_proc == orderby_proc &&
+                         !OidIsValid(norm_proc) &&
+                         commutator_op == orderby_op;
 
     snapshot = GetActiveSnapshot();
     if (snapshot == NULL)
@@ -68,12 +90,6 @@ HnswTopKForColumn(Relation heapRel,
                  errmsg("no active snapshot")));
 
     scan = index_beginscan(heapRel, indexRel, snapshot, 0, 1);
-    if (scan->numberOfOrderBys > 0)
-    {
-        scan->xs_orderbyvals = (Datum *) palloc0(sizeof(Datum) * scan->numberOfOrderBys);
-        scan->xs_orderbynulls = (bool *) palloc0(sizeof(bool) * scan->numberOfOrderBys);
-        scan->xs_orderbynulls[0] = true;
-    }
 
     ScanKeyEntryInitialize(&orderbykey,
                            0,
@@ -106,16 +122,26 @@ HnswTopKForColumn(Relation heapRel,
         bool all_dead = false;
         if (table_index_fetch_tuple(fetch, &out[n].tid, snapshot, slot, &call_again, &all_dead))
         {
-            bool isnull;
-            AttrNumber heap_attnum = indexRel->rd_index->indkey.values[col];
-            Datum val = slot_getattr(slot, heap_attnum, &isnull);
+            double index_distance;
 
-            if (!isnull)
+            if (can_reuse_distance &&
+                HnswGetLastDistance(scan, col, &index_distance))
             {
-                out[n].distance = DatumGetFloat8(OidFunctionCall2Coll(orderby_proc, InvalidOid, val, query));
+                out[n].distance = index_distance;
             }
             else
-                out[n].distance = 0.0;
+            {
+                bool isnull;
+                AttrNumber heap_attnum = indexRel->rd_index->indkey.values[col];
+                Datum val = slot_getattr(slot, heap_attnum, &isnull);
+
+                if (!isnull)
+                {
+                    out[n].distance = DatumGetFloat8(OidFunctionCall2Coll(orderby_proc, InvalidOid, val, query));
+                }
+                else
+                    out[n].distance = 0.0;
+            }
 
             ExecClearTuple(slot);
         }

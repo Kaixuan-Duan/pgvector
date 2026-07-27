@@ -414,6 +414,9 @@ typedef struct HnswScanOpaqueData
 	int			m;
 	int64		tuples;
 	double		previousDistance;
+	/* Distance attached to the most recently returned heap TID */
+	double		lastDistance;
+	bool		lastDistanceValid;
 	Size		maxMemory;
 	MemoryContext tmpCtx;
 
@@ -575,6 +578,7 @@ void		hnswrescan_dispatch(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey o
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
 bool		hnswgettuplemulti(IndexScanDesc scan, ScanDirection dir);
 bool		hnswgettuple_dispatch(IndexScanDesc scan, ScanDirection dir);
+bool		HnswGetLastDistance(IndexScanDesc scan, int col, double *distance);
 
 void		hnswendscan(IndexScanDesc scan);
 void		hnswendscanmulti(IndexScanDesc scan);

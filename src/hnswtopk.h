@@ -12,7 +12,7 @@
 typedef struct HnswTopKItem
 {
     ItemPointerData tid;
-    float8 distance;   /* 现在不再读取真实值，仅占位 */
+    float8 distance;   /* Distance used by the fusion score */
 } HnswTopKItem;
 
 /*
