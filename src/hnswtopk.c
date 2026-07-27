@@ -37,6 +37,9 @@ HnswTopKForColumn(Relation heapRel,
     ScanKeyData   orderbykey;
     Snapshot      snapshot;
     int           n = 0;
+    int           reused = 0;
+    int           recomputed = 0;
+    int           invisible = 0;
 
     if (out_nfound)
         *out_nfound = 0;
@@ -128,6 +131,7 @@ HnswTopKForColumn(Relation heapRel,
                 HnswGetLastDistance(scan, col, &index_distance))
             {
                 out[n].distance = index_distance;
+                reused++;
             }
             else
             {
@@ -135,6 +139,7 @@ HnswTopKForColumn(Relation heapRel,
                 AttrNumber heap_attnum = indexRel->rd_index->indkey.values[col];
                 Datum val = slot_getattr(slot, heap_attnum, &isnull);
 
+                recomputed++;
                 if (!isnull)
                 {
                     out[n].distance = DatumGetFloat8(OidFunctionCall2Coll(orderby_proc, InvalidOid, val, query));
@@ -146,10 +151,17 @@ HnswTopKForColumn(Relation heapRel,
             ExecClearTuple(slot);
         }
         else
+        {
             out[n].distance = 0.0;
+            invisible++;
+        }
 
         n++;
     }
+
+    elog(NOTICE,
+         "hydex distance source: col=%d reused=%d recomputed=%d invisible=%d",
+         col, reused, recomputed, invisible);
 
     ExecDropSingleTupleTableSlot(slot);
     table_index_fetch_end(fetch);
