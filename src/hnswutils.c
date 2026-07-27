@@ -270,8 +270,6 @@ HydexNormValue(HnswSupport *support, Datum value)
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("hydex normalization support function is not available")));
 
-	elog(NOTICE, "hydex linear diagnostic: normalize fmgr call oid=%u",
-		 normalizeOid);
 	return OidFunctionCall1Coll(normalizeOid, support->collation, value);
 }
 

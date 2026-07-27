@@ -737,19 +737,8 @@ vector_linear_prepare_results(VectorLinearScanState *st)
     HnswTopKItem *list2 = palloc0(sizeof(HnswTopKItem) * st->cand2);
     int n1 = 0, n2 = 0;
 
-    elog(NOTICE,
-         "hydex linear diagnostic: begin index=%u columns=%d/%d candidates=%d/%d",
-         RelationGetRelid(st->indexRel), st->col1, st->col2,
-         st->cand1, st->cand2);
-    elog(NOTICE, "hydex linear diagnostic: start top-k column=%d", st->col1);
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col1, st->op1, q1, st->cand1, list1, &n1);
-    elog(NOTICE, "hydex linear diagnostic: complete top-k column=%d results=%d",
-         st->col1, n1);
-    elog(NOTICE, "hydex linear diagnostic: start top-k column=%d", st->col2);
     HnswTopKForColumn(st->heapRel, st->indexRel, st->col2, st->op2, q2, st->cand2, list2, &n2);
-    elog(NOTICE, "hydex linear diagnostic: complete top-k column=%d results=%d",
-         st->col2, n2);
-    elog(NOTICE, "hydex linear diagnostic: start fusion n1=%d n2=%d", n1, n2);
 
     LinearResultItem *arr1 = palloc0(sizeof(LinearResultItem) * n1);
     if (n1 > 0)
@@ -867,8 +856,6 @@ vector_linear_prepare_results(VectorLinearScanState *st)
     pfree(arr2);
 
     qsort(arr, n, sizeof(LinearResultItem), cmp_linear_item_desc);
-
-    elog(NOTICE, "hydex linear diagnostic: fusion complete results=%d", n);
 
     if (st->limit > 0 && n > st->limit)
         n = st->limit;
